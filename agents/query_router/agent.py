@@ -432,6 +432,7 @@ class QueryAnalyzerAgent(BaseAgent):
                 logger.info("[query_analyzer] Running pipeline")
                 async for event in pipeline.run_async(ctx):
                     yield event
+
         else:
             logger.info("[query_analyzer] Skipping pipeline — passing to chat_agent")
             return

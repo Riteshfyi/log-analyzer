@@ -19,6 +19,8 @@ import threading
 import time
 import requests
 from collections import deque
+
+_log_cache: dict[str, dict[str, str]] = {}
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 from typing_extensions import override
@@ -1369,6 +1371,14 @@ class ExhaustiveSearchAgent(BaseAgent):
         ctx.session.state["wxcas_logs"] = json.dumps(
             [hit.get("_source", {}) for hit in all_logs["wxcas"]], default=str
         )
+
+        _log_cache[ctx.session.id] = {
+            "mobius_logs": ctx.session.state["mobius_logs"],
+            "sse_mse_logs": ctx.session.state["sse_mse_logs"],
+            "wxcas_logs": ctx.session.state["wxcas_logs"],
+            "all_logs": ctx.session.state["all_logs"],
+            "search_summary": ctx.session.state["search_summary"],
+        }
 
         logger.info(
             f"[{self.name}] ══ Search complete ══\n"

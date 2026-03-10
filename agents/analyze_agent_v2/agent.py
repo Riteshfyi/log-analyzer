@@ -221,17 +221,17 @@ Include SDP summary when available (codec, media type, ICE candidates count).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 mobius_error_skill = load_skill_from_dir(
-    Path(__file__).parent / "skills" / "mobius_error_id_skill"
+    Path(__file__).parent / "skills" / "mobius-error-id-skill"
 )
 mobius_skill_toolset = skill_toolset.SkillToolset(skills=[mobius_error_skill])
 
 architecture_endpoints_skill = load_skill_from_dir(
-    Path(__file__).parent / "skills" / "architecture_endpoints_skill"
+    Path(__file__).parent / "skills" / "architecture-endpoints-skill"
 )
 architecture_skill_toolset = skill_toolset.SkillToolset(skills=[architecture_endpoints_skill])
 
 sip_flow_skill = load_skill_from_dir(
-    Path(__file__).parent / "skills" / "sip_flow_skill"
+    Path(__file__).parent / "skills" / "sip-flow-skill"
 )
 sip_flow_skill_toolset = skill_toolset.SkillToolset(skills=[sip_flow_skill])
 
