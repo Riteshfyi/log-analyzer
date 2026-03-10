@@ -21,6 +21,7 @@ import requests
 from collections import deque
 
 _log_cache: dict[str, dict[str, str]] = {}
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 from typing_extensions import override
@@ -318,8 +319,8 @@ ID_TYPE_SEARCH_CONFIG = {
     "tracking_id": [
         {
             "service": "wxm_app",
-            "query_type": "wildcard",
-            "field": "fields.WEBEX_TRACKINGID.keyword",
+            "query_type": "match_phrase",
+            "field": "fields.WEBEX_TRACKINGID",
             "tag_filter": "mobius",
             "category": "mobius",
         },
@@ -334,7 +335,7 @@ ID_TYPE_SEARCH_CONFIG = {
         },
         {
             "service": "wxcalling",
-            "query_type": "wildcard_message",
+            "query_type": "match_phrase",
             "field": "message",
             "tag_filter": "sse_mse",
             "category": "sse_mse",
@@ -397,31 +398,31 @@ ID_TYPE_SEARCH_CONFIG = {
     "trace_id": [
         {
             "service": "wxm_app",
-            "query_type": "wildcard_message",
+            "query_type": "match_phrase",
             "field": "message",
             "tag_filter": "mobius",
             "category": "mobius",
         },
         {
             "service": "wxcalling",
-            "query_type": "wildcard_message",
+            "query_type": "match_phrase",
             "field": "message",
             "tag_filter": None,
             "category": "wxcas",
         },
     ],
-    # Fallback: wildcard message search on both services
+    # Fallback: match_phrase message search on both services
     "unknown": [
         {
             "service": "wxm_app",
-            "query_type": "wildcard_message",
+            "query_type": "match_phrase",
             "field": "message",
             "tag_filter": "mobius",
             "category": "mobius",
         },
         {
             "service": "wxcalling",
-            "query_type": "wildcard_message",
+            "query_type": "match_phrase",
             "field": "message",
             "tag_filter": None,
             "category": "wxcas",
@@ -455,6 +456,174 @@ MAPREDUCE_CHUNK_SIZE = 200
 
 # Regex for SSE Call-ID pattern in SIP message bodies
 SSE_CALLID_PATTERN = re.compile(r"SSE\d+@[\d.]+")
+
+# Pagination
+PAGE_SIZE = 100
+
+# Token budget caps
+TOKEN_BUDGET_PER_CALL = 16_000    # Max input tokens per single LLM call
+TOKEN_BUDGET_PER_STAGE = 60_000   # Max input tokens per search stage
+TOKEN_BUDGET_PER_RUN = 180_000    # Max input tokens per entire search run
+CHARS_PER_TOKEN_ESTIMATE = 4      # Rough chars-per-token for estimation
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Token Budget Manager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count from character length."""
+    return len(text) // CHARS_PER_TOKEN_ESTIMATE
+
+
+_COMPRESS_INSTRUCTION = """You are a log analysis compressor. You are given a rolling summary of microservice log analysis that has grown too large.
+
+Compress it to approximately HALF its current length while preserving:
+1. ALL unresolved errors, their timestamps, and error codes
+2. ALL correlation-critical IDs (session IDs, call IDs, tracking IDs that link services)
+3. Key timeline events (first event, last event, error events)
+4. Cross-service correlation evidence
+
+You MAY remove or abbreviate:
+- Redundant success confirmations
+- Detailed descriptions of normal/expected behavior
+- Verbose HTTP request/response details for successful calls
+- Duplicate information that appears in multiple summaries
+
+Output the compressed summary directly, no preamble."""
+
+
+_SUMMARIZER_INSTRUCTION = """You are a log analysis summarizer. Analyze the provided log entries and produce a concise summary focusing on:
+1. Key events and their timestamps
+2. Errors, warnings, and anomalies
+3. Service interactions (which services communicated, request/response pairs)
+4. Relevant IDs found (session IDs, call IDs, tracking IDs, etc.)
+5. SIP message flows if present
+6. HTTP request/response patterns
+
+Be specific with timestamps, status codes, and error messages. This summary will be used for further analysis."""
+
+
+@dataclass
+class TokenBudget:
+    """
+    Tracks token consumption across a search run with three budget levels.
+
+    Usage:
+        budget = TokenBudget()
+        budget.begin_stage("mobius")
+        if not budget.can_afford(prompt_text):
+            summary = await budget.compress_summary(current_summary)
+        budget.record_usage(prompt_tokens)
+        budget.end_stage()
+    """
+    per_call_cap: int = TOKEN_BUDGET_PER_CALL
+    per_stage_cap: int = TOKEN_BUDGET_PER_STAGE
+    per_run_cap: int = TOKEN_BUDGET_PER_RUN
+
+    run_tokens_used: int = 0
+    stage_tokens_used: int = 0
+    current_stage: str = ""
+
+    stage_history: list = dataclass_field(default_factory=list)
+
+    def begin_stage(self, stage_name: str) -> None:
+        if self.current_stage:
+            self.stage_history.append({
+                "stage": self.current_stage,
+                "tokens_used": self.stage_tokens_used,
+            })
+        self.current_stage = stage_name
+        self.stage_tokens_used = 0
+        logger.info(
+            f"[TokenBudget] Starting stage '{stage_name}' "
+            f"(run total: {self.run_tokens_used}/{self.per_run_cap})"
+        )
+
+    def end_stage(self) -> None:
+        if self.current_stage:
+            self.stage_history.append({
+                "stage": self.current_stage,
+                "tokens_used": self.stage_tokens_used,
+            })
+            logger.info(
+                f"[TokenBudget] Stage '{self.current_stage}' complete: "
+                f"{self.stage_tokens_used} tokens"
+            )
+            self.current_stage = ""
+            self.stage_tokens_used = 0
+
+    def record_usage(self, tokens: int) -> None:
+        self.run_tokens_used += tokens
+        self.stage_tokens_used += tokens
+
+    def can_afford(self, text: str) -> bool:
+        est = _estimate_tokens(text)
+        if est > self.per_call_cap:
+            logger.warning(f"[TokenBudget] Call would exceed per-call cap: {est} > {self.per_call_cap}")
+            return False
+        if self.stage_tokens_used + est > self.per_stage_cap:
+            logger.warning(f"[TokenBudget] Call would exceed per-stage cap: {self.stage_tokens_used + est} > {self.per_stage_cap}")
+            return False
+        if self.run_tokens_used + est > self.per_run_cap:
+            logger.warning(f"[TokenBudget] Call would exceed per-run cap: {self.run_tokens_used + est} > {self.per_run_cap}")
+            return False
+        return True
+
+    def remaining_run(self) -> int:
+        return max(0, self.per_run_cap - self.run_tokens_used)
+
+    def remaining_stage(self) -> int:
+        return max(0, self.per_stage_cap - self.stage_tokens_used)
+
+    async def compress_summary(self, summary: str) -> str:
+        if not summary or len(summary) < 500:
+            return summary
+
+        logger.info(
+            f"[TokenBudget] Compressing summary: "
+            f"{_estimate_tokens(summary)} tokens -> target ~{_estimate_tokens(summary) // 2}"
+        )
+
+        api_key = (
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("AZURE_OPENAI_API_KEY")
+            or "pending-oauth"
+        )
+        api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
+
+        try:
+            response = await litellm.acompletion(
+                model="openai/gpt-4.1",
+                api_key=api_key,
+                api_base=api_base,
+                extra_headers={"x-cisco-app": "microservice-log-analyzer"},
+                messages=[
+                    {"role": "system", "content": _COMPRESS_INSTRUCTION},
+                    {"role": "user", "content": summary},
+                ],
+                temperature=0,
+            )
+            compressed = response.choices[0].message.content or summary
+            savings = _estimate_tokens(summary) - _estimate_tokens(compressed)
+            logger.info(f"[TokenBudget] Compressed: saved ~{savings} tokens")
+            self.record_usage(_estimate_tokens(summary) + _estimate_tokens(_COMPRESS_INSTRUCTION))
+            return compressed
+        except Exception as e:
+            logger.error(f"[TokenBudget] Compression failed: {e}")
+            return summary
+
+    def get_summary(self) -> dict:
+        return {
+            "run_tokens_used": self.run_tokens_used,
+            "run_budget": self.per_run_cap,
+            "run_remaining": self.remaining_run(),
+            "stages": self.stage_history + (
+                [{"stage": self.current_stage, "tokens_used": self.stage_tokens_used}]
+                if self.current_stage else []
+            ),
+        }
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helper Functions
@@ -587,6 +756,92 @@ async def _extract_ids_mapreduce(
     return merged
 
 
+async def _summarize_hits(
+    condensed: list[dict],
+    budget: TokenBudget | None = None,
+) -> str:
+    """Summarize a batch of condensed log entries for the rolling summary."""
+    api_key = (
+        os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("AZURE_OPENAI_API_KEY")
+        or "pending-oauth"
+    )
+    api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
+    user_content = json.dumps(condensed, default=str)
+
+    full_prompt = _SUMMARIZER_INSTRUCTION + user_content
+    if budget and not budget.can_afford(full_prompt):
+        allowed_chars = budget.remaining_stage() * CHARS_PER_TOKEN_ESTIMATE - len(_SUMMARIZER_INSTRUCTION)
+        if allowed_chars < 500:
+            logger.warning("[_summarize_hits] Budget too tight, skipping summarization")
+            return "[Batch skipped due to token budget]"
+        user_content = user_content[:allowed_chars]
+        logger.info(f"[_summarize_hits] Trimmed for budget: {len(user_content)} chars")
+
+    try:
+        response = await litellm.acompletion(
+            model="openai/gpt-4.1",
+            api_key=api_key,
+            api_base=api_base,
+            extra_headers={"x-cisco-app": "microservice-log-analyzer"},
+            messages=[
+                {"role": "system", "content": _SUMMARIZER_INSTRUCTION},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+        )
+        if budget:
+            budget.record_usage(_estimate_tokens(full_prompt))
+        return response.choices[0].message.content or ""
+    except Exception as e:
+        logger.error(f"[_summarize_hits] Summarization failed: {e}")
+        return "[Summarization failed]"
+
+
+async def _extract_ids_from_batch(
+    condensed: list[dict],
+    instruction: str,
+    budget: TokenBudget | None = None,
+) -> dict:
+    """Extract IDs from a single batch of condensed entries, respecting budget."""
+    api_key = (
+        os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("AZURE_OPENAI_API_KEY")
+        or "pending-oauth"
+    )
+    api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
+    user_content = json.dumps(condensed, default=str)
+
+    full_prompt = instruction + user_content
+    if budget and not budget.can_afford(full_prompt):
+        allowed_chars = budget.remaining_stage() * CHARS_PER_TOKEN_ESTIMATE - len(instruction)
+        if allowed_chars < 500:
+            logger.warning("[_extract_ids_from_batch] Budget too tight, skipping")
+            return {}
+        user_content = user_content[:allowed_chars]
+        logger.info(f"[_extract_ids_from_batch] Trimmed for budget: {len(user_content)} chars")
+
+    try:
+        response = await litellm.acompletion(
+            model="openai/gpt-4.1",
+            api_key=api_key,
+            api_base=api_base,
+            extra_headers={"x-cisco-app": "microservice-log-analyzer"},
+            messages=[
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+        )
+        if budget:
+            budget.record_usage(_estimate_tokens(full_prompt))
+        raw = response.choices[0].message.content
+        return _parse_json_from_llm(raw)
+    except Exception as e:
+        logger.error(f"[_extract_ids_from_batch] Failed: {e}")
+        return {}
+
+
 def resolve_indexes(
     service: str, environments: list[str], regions: list[str]
 ) -> list[str]:
@@ -624,21 +879,20 @@ def build_query(
         time_range: Optional (gte, lte) ISO timestamps to scope the search.
                     Applied as a @timestamp range filter to avoid full-index scans.
     """
-    logger.debug(
-        f"[build_query] id_value={id_value}, query_type={query_type}, "
+    logger.info(
+        f"[build_query] INPUTS: id_value={id_value}, query_type={query_type}, "
         f"field={field}, tag_filter={tag_filter}, time_range={time_range}"
     )
     # ── ID match clause ──
+    # Uses term for exact keyword matches, match_phrase for text searches
+    # (consistent with MCP OpenSearch DSL — no wildcard queries)
     if query_type == "term":
         id_clause = {"term": {field: id_value}}
         logger.debug(f"[build_query] Using term query on {field}")
-    elif query_type == "wildcard":
-        val = id_value if "*" in id_value else f"{id_value}*"
-        id_clause = {"wildcard": {field: val}}
-        logger.debug(f"[build_query] Using wildcard query on {field}: {val}")
-    elif query_type == "wildcard_message":
-        id_clause = {"wildcard": {"message": f"*{id_value}*"}}
-        logger.debug(f"[build_query] Using wildcard message search for *{id_value}*")
+    elif query_type == "match_phrase":
+        target_field = field or "message"
+        id_clause = {"match_phrase": {target_field: id_value}}
+        logger.debug(f"[build_query] Using match_phrase on {target_field}")
     elif query_type == "session_id":
         # Search both localSessionId and remoteSessionId
         id_clause = {
@@ -652,66 +906,56 @@ def build_query(
         }
         logger.debug(f"[build_query] Using session_id dual-field query (local+remote)")
     else:
-        id_clause = {"wildcard": {"message": f"*{id_value}*"}}
-        logger.debug(f"[build_query] Unknown query_type '{query_type}', falling back to wildcard message")
+        # Fallback: match_phrase on message (uses inverted index, not char scan)
+        id_clause = {"match_phrase": {"message": id_value}}
+        logger.warning(f"[build_query] Unknown query_type '{query_type}', falling back to match_phrase on message")
 
-    # ── Tag filter clause ──
-    must_clauses: list[dict] = [id_clause]
+    # ── Filter clauses (no scoring, cacheable — consistent with MCP OpenSearch DSL) ──
+    filter_clauses: list[dict] = [id_clause]
 
     if tag_filter == "mobius":
-        must_clauses.append({"wildcard": {"tags": "*mobius*"}})
+        filter_clauses.append({"terms": {"tags": ["mobius"]}})
         logger.debug("[build_query] Added mobius tag filter")
     elif tag_filter == "sse_mse":
-        must_clauses.append(
-            {
-                "bool": {
-                    "should": [
-                        {"wildcard": {"tags": "*sse*"}},
-                        {"wildcard": {"tags": "*mse*"}},
-                    ],
-                    "minimum_should_match": 1,
-                }
-            }
-        )
+        filter_clauses.append({"terms": {"tags": ["sse", "mse"]}})
         logger.debug("[build_query] Added sse/mse tag filter")
     else:
         logger.debug("[build_query] No tag filter applied")
 
-    # ── Time range filter — scopes all queries to the derived time window ──
+    # ── Time range filter — always applied to avoid full-index scans ──
     if time_range:
-        must_clauses.append(
+        filter_clauses.append(
             {"range": {"@timestamp": {"gte": time_range[0], "lte": time_range[1]}}}
         )
         logger.debug(
             f"[build_query] Added time range filter: {time_range[0]} → {time_range[1]}"
         )
+    else:
+        filter_clauses.append(
+            {"range": {"@timestamp": {"gte": "now-7d/d", "format": "strict_date_optional_time"}}}
+        )
+        logger.debug("[build_query] Added default 7-day time range filter")
 
     query = {
-        "query": {"bool": {"must": must_clauses}},
-        "size": 10000,
-        "sort": [{"@timestamp": {"order": "asc"}}],
+        "query": {"bool": {"filter": filter_clauses}},
+        "size": PAGE_SIZE,
+        "sort": [{"@timestamp": {"order": "desc"}}],
     }
-    logger.debug(f"[build_query] Final query: {json.dumps(query, indent=2)}")
+    logger.info(f"[build_query] Final DSL: {json.dumps(query, default=str)}")
     return query
 
 
 async def search_opensearch(index: str, query: dict) -> dict:
     """
-    Execute an OpenSearch search directly. Parallel-safe — each call creates
-    its own client with its own token (no shared mutable state, no env var swap).
+    Execute an OpenSearch search with search_after pagination.
+    Returns all hits across all pages, accumulated into a single result dict.
+    Parallel-safe — each call creates its own client with its own token.
     """
-    logger.debug(f"[search_opensearch] Starting search for index={index}")
-    logger.debug(f"[search_opensearch] Query: {json.dumps(query, indent=2)}")
+    logger.debug(f"[search_opensearch] Starting paginated search for index={index}")
 
     is_int = index.endswith("-int")
     token = get_opensearch_token(is_int)
     url = OPENSEARCH_INDEX_URL_MAP.get(index)
-
-    logger.debug(
-        f"[search_opensearch] is_int={is_int}, "
-        f"token_present={'yes' if token else 'NO'}, "
-        f"token_len={len(token) if token else 0}, url={url}"
-    )
 
     if not url:
         logger.error(f"[search_opensearch] No URL mapping for index: {index}")
@@ -724,8 +968,7 @@ async def search_opensearch(index: str, query: dict) -> dict:
         )
         return {"hits": {"hits": [], "total": {"value": 0}}}
 
-    def _do_search() -> dict:
-        logger.debug(f"[search_opensearch] Creating OpenSearch client for {url}")
+    def _do_paginated_search() -> dict:
         client = OpenSearch(
             hosts=[url],
             use_ssl=True,
@@ -734,24 +977,150 @@ async def search_opensearch(index: str, query: dict) -> dict:
             headers={"Authorization": f"Bearer {token}"},
             timeout=3000,
         )
-        logger.debug(f"[search_opensearch] Executing client.search(index={index})")
-        result = client.search(index=index, body=query)
-        hit_count = len(result.get("hits", {}).get("hits", []))
-        total = result.get("hits", {}).get("total", {})
-        logger.debug(
-            f"[search_opensearch] Search complete: {hit_count} hits returned, "
-            f"total={total}, took={result.get('took', '?')}ms, "
-            f"timed_out={result.get('timed_out', '?')}"
+
+        all_hits = []
+        total_value = 0
+        page_query = dict(query)
+        page_num = 0
+
+        while True:
+            page_num += 1
+            logger.debug(f"[search_opensearch] Page {page_num} for {index}")
+
+            result = client.search(index=index, body=page_query)
+            hits = result.get("hits", {}).get("hits", [])
+            total_info = result.get("hits", {}).get("total", {})
+
+            if page_num == 1:
+                total_value = total_info.get("value", 0) if isinstance(total_info, dict) else total_info
+
+            all_hits.extend(hits)
+
+            logger.debug(
+                f"[search_opensearch] Page {page_num}: {len(hits)} hits "
+                f"(cumulative: {len(all_hits)}, total: {total_value})"
+            )
+
+            if len(hits) < PAGE_SIZE:
+                break
+
+            last_hit = hits[-1]
+            sort_values = last_hit.get("sort")
+            if not sort_values:
+                logger.warning(
+                    f"[search_opensearch] No sort values on last hit, "
+                    f"stopping pagination at page {page_num}"
+                )
+                break
+
+            page_query = dict(query)
+            page_query["search_after"] = sort_values
+
+        logger.info(
+            f"[search_opensearch] Completed {page_num} page(s) for {index}: "
+            f"{len(all_hits)} total hits (server total: {total_value})"
         )
-        return result
+
+        return {
+            "hits": {
+                "hits": all_hits,
+                "total": {"value": total_value},
+            },
+            "pages": page_num,
+        }
 
     try:
-        result = await asyncio.to_thread(_do_search)
-        logger.debug(f"[search_opensearch] async search_opensearch completed for {index}")
+        result = await asyncio.to_thread(_do_paginated_search)
         return result
     except Exception as e:
-        logger.error(f"[search_opensearch] Search failed for index {index}: {type(e).__name__}: {e}", exc_info=True)
+        logger.error(
+            f"[search_opensearch] Search failed for index {index}: "
+            f"{type(e).__name__}: {e}", exc_info=True
+        )
         return {"hits": {"hits": [], "total": {"value": 0}}}
+
+
+async def search_opensearch_pages(
+    index: str,
+    query: dict,
+) -> AsyncGenerator[list[dict], None]:
+    """
+    Streaming paginated search — yields each page of hits as it arrives.
+    Used by the progressive staged search to process batches incrementally.
+    """
+    is_int = index.endswith("-int")
+    token = get_opensearch_token(is_int)
+    url = OPENSEARCH_INDEX_URL_MAP.get(index)
+
+    logger.info(
+        f"[search_opensearch_pages] Starting paginated search: index={index}, "
+        f"url={url}, has_token={'yes' if token else 'NO'}, "
+        f"is_int={is_int}"
+    )
+    logger.info(f"[search_opensearch_pages] Query DSL: {json.dumps(query, default=str)}")
+
+    if not url or not token:
+        logger.error(
+            f"[search_opensearch_pages] Missing URL or token for {index} "
+            f"(url={'set' if url else 'MISSING'}, token={'set' if token else 'MISSING'})"
+        )
+        return
+
+    def _fetch_page(page_query: dict) -> dict:
+        client = OpenSearch(
+            hosts=[url],
+            use_ssl=True,
+            verify_certs=True,
+            connection_class=RequestsHttpConnection,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=3000,
+        )
+        return client.search(index=index, body=page_query)
+
+    page_query = dict(query)
+    page_num = 0
+
+    while True:
+        page_num += 1
+        logger.info(
+            f"[search_opensearch_pages] Fetching page {page_num} for {index}, "
+            f"search_after={page_query.get('search_after', 'none')}"
+        )
+        try:
+            result = await asyncio.to_thread(_fetch_page, page_query)
+        except Exception as e:
+            logger.error(f"[search_opensearch_pages] Page {page_num} failed: {e}")
+            break
+
+        total_info = result.get("hits", {}).get("total", {})
+        total_value = total_info.get("value", 0) if isinstance(total_info, dict) else total_info
+        hits = result.get("hits", {}).get("hits", [])
+
+        logger.info(
+            f"[search_opensearch_pages] Page {page_num} result: "
+            f"{len(hits)} hits returned, server total={total_value}"
+        )
+
+        if not hits:
+            logger.info(f"[search_opensearch_pages] No hits on page {page_num}, stopping")
+            break
+
+        yield hits
+
+        if len(hits) < PAGE_SIZE:
+            logger.info(
+                f"[search_opensearch_pages] Last page ({len(hits)} < PAGE_SIZE={PAGE_SIZE}), stopping"
+            )
+            break
+
+        sort_values = hits[-1].get("sort")
+        if not sort_values:
+            logger.warning(f"[search_opensearch_pages] No sort values on last hit, stopping")
+            break
+
+        logger.info(f"[search_opensearch_pages] search_after cursor: {sort_values}")
+        page_query = dict(query)
+        page_query["search_after"] = sort_values
 
 
 def extract_id_fields_for_llm(hits: list[dict]) -> list[dict]:
@@ -1002,25 +1371,159 @@ class ExhaustiveSearchAgent(BaseAgent):
             sub_agents=[query_parser, id_extractor],
         )
 
+    # ── Helper: process a page of hits progressively ──
+    async def _process_hits_progressive(
+        self,
+        hits: list[dict],
+        all_logs: dict[str, list[dict]],
+        seen_hit_ids: set[str],
+        category: str,
+        rolling_summary: str,
+        budget: TokenBudget,
+        id_extractor_instruction: str,
+    ) -> tuple[str, dict, int]:
+        """
+        Process a page of hits: deduplicate, extract IDs, summarize, update rolling summary.
+        Returns (updated_rolling_summary, extracted_ids, new_unique_count).
+        """
+        # Deduplicate
+        new_hits = []
+        dupes = 0
+        for hit in hits:
+            hid = hit.get("_id", "")
+            if hid and hid not in seen_hit_ids:
+                seen_hit_ids.add(hid)
+                all_logs[category].append(hit)
+                new_hits.append(hit)
+            else:
+                dupes += 1
+
+        logger.info(
+            f"[_process_hits_progressive] category={category}: "
+            f"{len(hits)} hits in, {len(new_hits)} new, {dupes} dupes, "
+            f"seen_hit_ids total={len(seen_hit_ids)}, "
+            f"all_logs[{category}] total={len(all_logs[category])}"
+        )
+
+        if not new_hits:
+            logger.info(f"[_process_hits_progressive] All dupes for {category}, skipping")
+            return rolling_summary, {}, 0
+
+        condensed = extract_id_fields_for_llm(new_hits)
+        logger.info(
+            f"[_process_hits_progressive] Condensed {len(new_hits)} hits -> "
+            f"{len(condensed)} entries for LLM"
+        )
+
+        # Run ID extraction + summarization in parallel, respecting budget
+        extracted, batch_summary = await asyncio.gather(
+            _extract_ids_from_batch(condensed, id_extractor_instruction, budget),
+            _summarize_hits(condensed, budget),
+        )
+        logger.info(
+            f"[_process_hits_progressive] LLM results: "
+            f"extracted_ids={json.dumps({k: len(v) for k, v in extracted.items() if v}, default=str)}, "
+            f"summary_len={len(batch_summary) if batch_summary else 0}"
+        )
+
+        # Append batch summary to rolling summary
+        if rolling_summary:
+            rolling_summary = f"{rolling_summary}\n\n---\n\n{batch_summary}"
+        else:
+            rolling_summary = batch_summary
+
+        # If rolling summary is getting large, compress it
+        if not budget.can_afford(rolling_summary):
+            logger.info(f"[{self.name}] Rolling summary too large, compressing...")
+            rolling_summary = await budget.compress_summary(rolling_summary)
+
+        return rolling_summary, extracted, len(new_hits)
+
+    # ── Helper: merge extracted IDs into accumulated set ──
+    @staticmethod
+    def _merge_extracted_ids(accumulated: dict, new_ids: dict) -> dict:
+        """Merge new extracted IDs into the accumulated dict, deduplicating."""
+        id_keys = [
+            "session_ids", "tracking_ids", "mobius_call_ids", "sip_call_ids",
+            "sse_call_ids", "call_ids", "user_ids", "device_ids", "trace_ids",
+        ]
+        if not accumulated:
+            accumulated = {k: [] for k in id_keys}
+        for key in id_keys:
+            existing = set(accumulated.get(key, []))
+            for val in new_ids.get(key, []):
+                val = str(val).strip()
+                if val and val not in existing:
+                    existing.add(val)
+                    accumulated.setdefault(key, []).append(val)
+        return accumulated
+
+    # ── Helper: add newly extracted IDs to frontier ──
+    def _enqueue_new_ids(
+        self,
+        extracted: dict,
+        all_seen_ids: set[str],
+        frontier: deque,
+        current_depth: int,
+    ) -> tuple[int, int, int]:
+        """Returns (new_count, skipped_seen, skipped_dummy)."""
+        logger.info(
+            f"[{self.name}] _enqueue_new_ids: depth={current_depth}, "
+            f"all_seen_ids={len(all_seen_ids)}, frontier_before={len(frontier)}, "
+            f"extracted keys with values: "
+            f"{json.dumps({k: len(v) for k, v in extracted.items() if v}, default=str)}"
+        )
+        new_ids_count = 0
+        skipped_seen = 0
+        skipped_dummy = 0
+        for extract_key, id_type in EXTRACTOR_KEY_TO_ID_TYPE.items():
+            ids = extracted.get(extract_key, [])
+            if isinstance(ids, str):
+                ids = [ids]
+            for id_val in ids:
+                id_val = str(id_val).strip()
+                if not id_val or id_val in DUMMY_ID_VALUES:
+                    skipped_dummy += 1
+                    logger.debug(f"[{self.name}]   SKIP dummy: {extract_key}='{id_val}'")
+                    continue
+                if id_val.startswith("NA_"):
+                    skipped_dummy += 1
+                    logger.debug(f"[{self.name}]   SKIP NA_ prefix: {extract_key}='{id_val}'")
+                    continue
+                if id_val in all_seen_ids:
+                    skipped_seen += 1
+                    logger.debug(f"[{self.name}]   SKIP already seen: {id_type}='{id_val}'")
+                    continue
+                frontier.append((id_val, id_type, current_depth + 1))
+                all_seen_ids.add(id_val)
+                new_ids_count += 1
+                logger.info(f"[{self.name}]   ENQUEUE: {id_type}='{id_val}' -> depth {current_depth + 1}")
+                print(f"  + {id_type} = {id_val} -> queued for depth {current_depth + 1}")
+
+        logger.info(
+            f"[{self.name}] _enqueue_new_ids result: new={new_ids_count}, "
+            f"skipped_seen={skipped_seen}, skipped_dummy={skipped_dummy}, "
+            f"frontier_after={len(frontier)}"
+        )
+        return new_ids_count, skipped_seen, skipped_dummy
+
     @override
     async def _run_async_impl(
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
-        logger.info(f"[{self.name}] Starting exhaustive search workflow")
-        logger.debug(f"[{self.name}] max_depth={self.max_depth}")
-        logger.debug(f"[{self.name}] Session state keys at start: {list(ctx.session.state.keys())}")
+        logger.info(f"[{self.name}] Starting progressive staged search")
 
         # ══════════════════════════════════════════════════════════════════════
         # Step 1: Parse the user's query via LLM
         # ══════════════════════════════════════════════════════════════════════
         logger.info(f"[{self.name}] Step 1: Parsing user query via LLM...")
         async for event in self.query_parser.run_async(ctx):
-            logger.debug(f"[{self.name}] query_parser event: author={event.author}, is_final={event.is_final_response()}")
             yield event
 
         raw_parsed = ctx.session.state.get("parsed_query", "{}")
-        logger.debug(f"[{self.name}] Raw parsed_query from state: {str(raw_parsed)[:500]}")
+        logger.info(f"[{self.name}] Raw parsed_query from LLM: {raw_parsed}")
         parsed = _parse_json_from_llm(raw_parsed)
+        logger.info(f"[{self.name}] Parsed JSON: {json.dumps(parsed, default=str)}")
 
         identifiers = parsed.get("identifiers", [])
         environments = parsed.get("environments", ["prod"])
@@ -1029,29 +1532,33 @@ class ExhaustiveSearchAgent(BaseAgent):
 
         ctx.session.state["detailed_analysis"] = detailed_analysis
 
+        logger.info(
+            f"[{self.name}] Query params: identifiers={json.dumps(identifiers, default=str)}, "
+            f"envs={environments}, regions={regions}, detailedAnalysis={detailed_analysis}"
+        )
+
         if not identifiers:
-            logger.error(f"[{self.name}] No identifiers found in parsed query. Full parsed result: {parsed}")
+            logger.error(f"[{self.name}] No identifiers found in parsed query")
             return
 
         logger.info(
             f"[{self.name}] Parsed {len(identifiers)} identifier(s), "
             f"envs={environments}, regions={regions}"
         )
-        for i, ident in enumerate(identifiers):
-            logger.debug(f"[{self.name}]   Identifier {i}: value='{ident.get('value')}', type='{ident.get('type')}'")
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 2: Initialize BFS
+        # Step 2: Initialize BFS + Token Budget
         # ══════════════════════════════════════════════════════════════════════
-        all_seen_ids: set[str] = set()  # visited + queued (prevents frontier dupes)
-        frontier: deque[tuple[str, str, int]] = deque()  # (id_value, id_type, depth)
+        budget = TokenBudget()
+        all_seen_ids: set[str] = set()
+        frontier: deque[tuple[str, str, int]] = deque()
         all_logs: dict[str, list[dict]] = {"mobius": [], "sse_mse": [], "wxcas": []}
-        seen_hit_ids: set[str] = set()  # OpenSearch _id deduplication
+        seen_hit_ids: set[str] = set()
         search_history: list[dict] = []
+        all_extracted_ids: dict = {}
+        rolling_summary: str = ""
+        chunk_summaries: list[str] = []
         max_depth_reached = 0
-        # Derived time window — computed from depth-0 results and applied to
-        # subsequent depths so wildcard_message queries don't full-index-scan.
-        # Padded ±2 hours to catch slightly out-of-order logs.
         TIME_PADDING_HOURS = 2
         derived_time_range: tuple[str, str] | None = None
 
@@ -1061,24 +1568,29 @@ class ExhaustiveSearchAgent(BaseAgent):
             if id_val not in all_seen_ids:
                 frontier.append((id_val, id_type, 0))
                 all_seen_ids.add(id_val)
-                logger.debug(f"[{self.name}] Seeded frontier: {id_type}='{id_val}' at depth 0")
+                logger.info(f"[{self.name}] Seeded frontier: {id_type}={id_val} at depth 0")
 
-        logger.debug(f"[{self.name}] BFS initialized: frontier_size={len(frontier)}, all_seen_ids={all_seen_ids}")
+        logger.info(
+            f"[{self.name}] BFS initialized: frontier={len(frontier)}, "
+            f"all_seen_ids={all_seen_ids}, derived_time_range={derived_time_range}"
+        )
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 3: BFS Loop
+        # Step 3: Progressive BFS Loop with staged retrieval
         # ══════════════════════════════════════════════════════════════════════
         while frontier:
-            # ── 3a: Collect all IDs at the current depth level ──
             current_depth = frontier[0][2]
             max_depth_reached = max(max_depth_reached, current_depth)
 
             if current_depth > self.max_depth:
-                logger.info(
-                    f"[{self.name}] Reached max depth {self.max_depth}, stopping"
-                )
+                logger.info(f"[{self.name}] Reached max depth {self.max_depth}, stopping")
                 break
 
+            if budget.remaining_run() < 5000:
+                logger.warning(f"[{self.name}] Run budget nearly exhausted ({budget.remaining_run()} tokens left), stopping")
+                break
+
+            # ── 3a: Collect all IDs at current depth ──
             current_batch: list[tuple[str, str]] = []
             while frontier and frontier[0][2] == current_depth:
                 id_val, id_type, depth = frontier.popleft()
@@ -1087,35 +1599,41 @@ class ExhaustiveSearchAgent(BaseAgent):
             if not current_batch:
                 continue
 
-            logger.info(
-                f"[{self.name}] ── Depth {current_depth}: "
-                f"searching {len(current_batch)} ID(s) ──"
-            )
-            print(f"\n{'═'*60}")
-            print(f"🔍 Depth {current_depth}: searching {len(current_batch)} ID(s)")
-            for id_val, id_type in current_batch:
-                print(f"  → {id_type} = {id_val}")
-            print(f"{'═'*60}")
+            # Determine stage name from the dominant category
+            stage_name = f"depth_{current_depth}"
+            budget.begin_stage(stage_name)
 
-            # ── 3b: Build all search queries ──
-            # Each task: (index, query, id_val, category)
+            logger.info(
+                f"[{self.name}] -- Depth {current_depth}: "
+                f"searching {len(current_batch)} ID(s) --"
+            )
+            print(f"\n{'='*60}")
+            print(f"  Depth {current_depth}: searching {len(current_batch)} ID(s)")
+            for id_val, id_type in current_batch:
+                print(f"  -> {id_type} = {id_val}")
+            print(f"{'='*60}")
+
+            # ── 3b: Build search tasks ──
             search_tasks: list[tuple[str, dict, str, str]] = []
 
             for id_val, id_type in current_batch:
                 configs = ID_TYPE_SEARCH_CONFIG.get(
                     id_type, ID_TYPE_SEARCH_CONFIG["unknown"]
                 )
-                logger.debug(
-                    f"[{self.name}] Classifying {id_type}='{id_val}' → "
-                    f"{len(configs)} search target(s): "
-                    f"{[c['service']+'/'+c['category'] for c in configs]}"
+                logger.info(
+                    f"[{self.name}] ID: {id_type}={id_val} -> "
+                    f"{len(configs)} config(s) from ID_TYPE_SEARCH_CONFIG"
                 )
                 for config in configs:
                     indexes = resolve_indexes(
                         config["service"], environments, regions
                     )
-                    # Pass time range — build_query will only apply it
-                    # for wildcard_message queries to avoid 504s
+                    logger.info(
+                        f"[{self.name}]   Config: service={config['service']}, "
+                        f"query_type={config['query_type']}, field={config.get('field')}, "
+                        f"tag_filter={config['tag_filter']}, category={config['category']} "
+                        f"-> resolved indexes={indexes}"
+                    )
                     query = build_query(
                         id_val,
                         config["query_type"],
@@ -1123,225 +1641,174 @@ class ExhaustiveSearchAgent(BaseAgent):
                         config["tag_filter"],
                         time_range=derived_time_range,
                     )
+                    logger.info(
+                        f"[{self.name}]   Built DSL: {json.dumps(query, default=str)}"
+                    )
                     category = config["category"]
-
                     for index in indexes:
                         search_tasks.append((index, query, id_val, category))
-                        logger.info(
-                            f"[{self.name}]   Queued: {index} | "
-                            f"{id_type}={id_val} → {category}"
-                        )
+                        logger.info(f"[{self.name}]   Queued: {index} | {id_type}={id_val} -> {category}")
 
             if not search_tasks:
+                budget.end_stage()
                 continue
 
-            # ── 3c: Execute all searches in parallel ──
-            logger.info(
-                f"[{self.name}] Executing {len(search_tasks)} search(es) in parallel..."
-            )
-            logger.debug(
-                f"[{self.name}] Search tasks: "
-                f"{[(t[0], t[2], t[3]) for t in search_tasks]}"
-            )
+            # ── 3c: Progressive retrieval — stream pages per search task ──
+            logger.info(f"[{self.name}] Executing {len(search_tasks)} search(es) with progressive pagination...")
 
             import time as _time
             _search_start = _time.monotonic()
 
-            results = await asyncio.gather(
-                *[search_opensearch(task[0], task[1]) for task in search_tasks],
-                return_exceptions=True,
-            )
+            depth_new_hits = 0
+
+            for task_idx, (index, query, id_val, category) in enumerate(search_tasks):
+                task_hits = 0
+                logger.info(
+                    f"[{self.name}] Search task {task_idx+1}/{len(search_tasks)}: "
+                    f"index={index}, id_val={id_val}, category={category}"
+                )
+                page_count = 0
+                async for page_hits in search_opensearch_pages(index, query):
+                    page_count += 1
+                    task_hits += len(page_hits)
+                    logger.info(
+                        f"[{self.name}]   Task {task_idx+1} page {page_count}: "
+                        f"{len(page_hits)} hits (task cumulative: {task_hits})"
+                    )
+
+                    # Process this page progressively
+                    rolling_summary, page_extracted, new_count = await self._process_hits_progressive(
+                        hits=page_hits,
+                        all_logs=all_logs,
+                        seen_hit_ids=seen_hit_ids,
+                        category=category,
+                        rolling_summary=rolling_summary,
+                        budget=budget,
+                        id_extractor_instruction=self.id_extractor.instruction,
+                    )
+                    depth_new_hits += new_count
+
+                    logger.info(
+                        f"[{self.name}]   After processing: new_unique={new_count}, "
+                        f"depth_new_hits={depth_new_hits}, "
+                        f"extracted_ids={json.dumps(page_extracted, default=str)}"
+                    )
+
+                    # Merge extracted IDs
+                    all_extracted_ids = self._merge_extracted_ids(all_extracted_ids, page_extracted)
+
+                    logger.info(
+                        f"[{self.name}]   Cumulative extracted IDs: "
+                        f"{json.dumps({k: len(v) for k, v in all_extracted_ids.items() if v}, default=str)}"
+                    )
+
+                    # Check stage budget — if exhausted, stop paging this task
+                    if budget.remaining_stage() < 2000:
+                        logger.warning(f"[{self.name}] Stage budget low ({budget.remaining_stage()} remaining), stopping pagination for {index}")
+                        break
+
+                logger.info(
+                    f"[{self.name}] Task {task_idx+1} complete: index={index}, "
+                    f"total_hits={task_hits}, pages={page_count}"
+                )
+
+                search_history.append({
+                    "depth": current_depth,
+                    "index": index,
+                    "id_searched": id_val,
+                    "category": category,
+                    "hits_found": task_hits,
+                })
+
+                if task_hits > 0:
+                    print(f"  {index}: {task_hits} hit(s) for {id_val} -> {category}")
 
             _search_elapsed = _time.monotonic() - _search_start
-            logger.debug(
-                f"[{self.name}] All {len(search_tasks)} parallel searches "
-                f"completed in {_search_elapsed:.2f}s"
+            logger.info(
+                f"[{self.name}] Depth {current_depth}: {depth_new_hits} new unique hits "
+                f"in {_search_elapsed:.2f}s"
             )
-
-            # ── 3d: Collect and categorize results ──
-            batch_hits: list[dict] = []
-            total_hits = 0
-
-            for (index, query, id_val, category), result in zip(
-                search_tasks, results
-            ):
-                if isinstance(result, Exception):
-                    logger.error(
-                        f"[{self.name}] Search error for {index}: {result}"
-                    )
-                    continue
-
-                hits = result.get("hits", {}).get("hits", [])
-                hit_count = len(hits)
-                total_hits += hit_count
-
-                search_history.append(
-                    {
-                        "depth": current_depth,
-                        "index": index,
-                        "id_searched": id_val,
-                        "category": category,
-                        "hits_found": hit_count,
-                    }
-                )
-
-                # Deduplicate by OpenSearch _id
-                dupes_skipped = 0
-                for hit in hits:
-                    hid = hit.get("_id", "")
-                    if hid and hid not in seen_hit_ids:
-                        seen_hit_ids.add(hid)
-                        all_logs[category].append(hit)
-                        batch_hits.append(hit)
-                    elif hid:
-                        dupes_skipped += 1
-                if dupes_skipped:
-                    logger.debug(f"[{self.name}]   {index}: skipped {dupes_skipped} duplicate hit(s)")
-
-                logger.info(
-                    f"[{self.name}]   {index}: {hit_count} hit(s) for {id_val}"
-                )
-                if hit_count > 0:
-                    print(f"  📄 {index}: {hit_count} hit(s) for {id_val} → {category}")
-
-            if not batch_hits:
-                logger.info(
-                    f"[{self.name}] No new results at depth {current_depth}, "
-                    f"continuing to next depth..."
-                )
-                continue
 
             logger.info(
-                f"[{self.name}] Depth {current_depth} total: "
-                f"{total_hits} hits ({len(batch_hits)} new unique)"
+                f"[{self.name}] Depth {current_depth} search phase done: "
+                f"depth_new_hits={depth_new_hits}, derived_time_range={derived_time_range}, "
+                f"all_logs counts={{ {k}: {len(v)} for k, v in all_logs.items() }}, "
+                f"seen_hit_ids={len(seen_hit_ids)}, budget_stage={budget.remaining_stage()}, "
+                f"budget_run={budget.remaining_run()}"
             )
 
-            # ── Derive time range from results (first time only) ──
-            if derived_time_range is None:
+            # ── Derive time range from first results ──
+            if derived_time_range is None and depth_new_hits > 0:
                 from datetime import datetime, timedelta, timezone
                 timestamps: list[str] = []
-                for hit in batch_hits:
-                    ts = hit.get("_source", {}).get("@timestamp")
-                    if ts:
-                        timestamps.append(str(ts))
+                for cat_hits in all_logs.values():
+                    for hit in cat_hits:
+                        ts = hit.get("_source", {}).get("@timestamp")
+                        if ts:
+                            timestamps.append(str(ts))
                 if timestamps:
                     timestamps.sort()
                     try:
-                        t_min = datetime.fromisoformat(
-                            timestamps[0].replace("Z", "+00:00")
-                        )
-                        t_max = datetime.fromisoformat(
-                            timestamps[-1].replace("Z", "+00:00")
-                        )
+                        t_min = datetime.fromisoformat(timestamps[0].replace("Z", "+00:00"))
+                        t_max = datetime.fromisoformat(timestamps[-1].replace("Z", "+00:00"))
                         pad = timedelta(hours=TIME_PADDING_HOURS)
                         derived_time_range = (
                             (t_min - pad).isoformat(),
                             (t_max + pad).isoformat(),
                         )
                         logger.info(
-                            f"[{self.name}] Derived time range from "
-                            f"{len(timestamps)} timestamps: "
-                            f"{derived_time_range[0]} → {derived_time_range[1]}"
+                            f"[{self.name}] Derived time range: "
+                            f"{derived_time_range[0]} -> {derived_time_range[1]}"
                         )
                     except (ValueError, IndexError) as e:
-                        logger.warning(
-                            f"[{self.name}] Failed to parse timestamps "
-                            f"for time range: {e}"
-                        )
+                        logger.warning(f"[{self.name}] Failed to parse timestamps: {e}")
 
-            # ── 3e: Extract IDs — LLM map-reduce ──
-            condensed = extract_id_fields_for_llm(batch_hits)
-
-            state_payload = json.dumps(condensed, default=str)
-            ctx.session.state["latest_search_results"] = state_payload
-
-            n_chunks = max(1, (len(condensed) + MAPREDUCE_CHUNK_SIZE - 1) // MAPREDUCE_CHUNK_SIZE)
-            logger.info(
-                f"[{self.name}] Running map-reduce ID extraction on "
-                f"{len(condensed)} entries ({n_chunks} chunks)..."
-            )
-            print(f"  🧠 Running LLM extraction on {len(condensed)} entries ({n_chunks} chunks)...")
-
-            extracted = await _extract_ids_mapreduce(
-                condensed,
-                instruction=self.id_extractor.instruction,
+            # ── Store latest state ──
+            ctx.session.state["extracted_ids"] = json.dumps(all_extracted_ids, default=str)
+            ctx.session.state["latest_search_results"] = json.dumps(
+                extract_id_fields_for_llm(
+                    [h for cat in all_logs.values() for h in cat[-100:]]  # last 100 per cat
+                ),
+                default=str,
             )
 
-            # Store in session state so downstream agents can see it
-            ctx.session.state["extracted_ids"] = json.dumps(extracted, default=str)
-
-            total_ids = sum(
-                len(v) for v in extracted.values() if isinstance(v, list)
-            )
-            logger.info(f"[{self.name}] LLM extracted {total_ids} IDs")
-            for key, vals in extracted.items():
-                if vals:
-                    print(f"  🧠 {key}: {len(vals)} — {vals}")
-
-            # Yield a synthetic event so downstream agents see the extraction
+            # Yield a progress event
             yield Event(
                 author=self.name,
                 invocation_id=ctx.invocation_id,
                 content=genai_types.Content(
-                    parts=[genai_types.Part(text=json.dumps(extracted, default=str))],
+                    parts=[genai_types.Part(text=json.dumps(all_extracted_ids, default=str))],
                     role="model",
                 ),
             )
 
-            # ── 3f: Add new IDs to frontier ──
-            logger.debug(f"[{self.name}] Processing extracted IDs: {json.dumps({k: v for k, v in extracted.items() if v}, default=str)}")
-
-            new_ids_count = 0
-            skipped_seen = 0
-            skipped_dummy = 0
-            for extract_key, id_type in EXTRACTOR_KEY_TO_ID_TYPE.items():
-                ids = extracted.get(extract_key, [])
-                if isinstance(ids, str):
-                    ids = [ids]
-                if ids:
-                    logger.debug(f"[{self.name}]   {extract_key}: {len(ids)} ID(s) found: {ids}")
-                for id_val in ids:
-                    id_val = str(id_val).strip()
-                    if not id_val or id_val in DUMMY_ID_VALUES:
-                        skipped_dummy += 1
-                        continue
-                    if id_val.startswith("NA_"):
-                        skipped_dummy += 1
-                        logger.debug(f"[{self.name}]   Skipping NA_ prefixed ID: '{id_val}'")
-                        continue
-                    if id_val in all_seen_ids:
-                        skipped_seen += 1
-                        logger.debug(f"[{self.name}]   Skipping already-seen {id_type}='{id_val}'")
-                        continue
-                    frontier.append((id_val, id_type, current_depth + 1))
-                    all_seen_ids.add(id_val)
-                    new_ids_count += 1
-                    logger.debug(f"[{self.name}]   NEW: {id_type}='{id_val}' → frontier at depth {current_depth + 1}")
-                    print(f"  🆕 {id_type} = {id_val} → queued for depth {current_depth + 1}")
+            # ── Enqueue new IDs ──
+            new_count, skipped_seen, skipped_dummy = self._enqueue_new_ids(
+                all_extracted_ids, all_seen_ids, frontier, current_depth,
+            )
 
             logger.info(
-                f"[{self.name}] Extraction summary: {new_ids_count} new, "
-                f"{skipped_seen} already-seen, {skipped_dummy} dummy/empty. "
-                f"Frontier size: {len(frontier)}"
-            )
-            print(
-                f"\n📊 Extraction summary: {new_ids_count} new, "
-                f"{skipped_seen} already-seen, {skipped_dummy} dummy/empty. "
+                f"[{self.name}] Depth {current_depth} summary: {new_count} new IDs, "
+                f"{skipped_seen} already-seen, {skipped_dummy} dummy. "
                 f"Frontier: {len(frontier)} pending"
             )
+            print(
+                f"\n  Depth {current_depth} summary: {new_count} new IDs, "
+                f"{skipped_seen} already-seen, {skipped_dummy} dummy. "
+                f"Frontier: {len(frontier)} pending"
+            )
+
+            # Save chunk summary for this depth
+            if rolling_summary:
+                chunk_summaries.append(rolling_summary)
+
+            budget.end_stage()
 
         # ══════════════════════════════════════════════════════════════════════
         # Step 4: Store final results in session state
         # ══════════════════════════════════════════════════════════════════════
         logger.info(f"[{self.name}] Step 4: Storing final results in session state")
-        logger.debug(
-            f"[{self.name}] Final log counts — mobius: {len(all_logs['mobius'])}, "
-            f"sse_mse: {len(all_logs['sse_mse'])}, wxcas: {len(all_logs['wxcas'])}"
-        )
-        logger.debug(f"[{self.name}] All IDs searched: {all_seen_ids}")
-        logger.debug(f"[{self.name}] Search history: {json.dumps(search_history, indent=2, default=str)}")
 
-        # Full logs — all results for programmatic use / export
         ctx.session.state["all_logs"] = json.dumps(
             {
                 category: [hit.get("_source", {}) for hit in hits]
@@ -1350,6 +1817,7 @@ class ExhaustiveSearchAgent(BaseAgent):
             default=str,
         )
 
+        budget_summary = budget.get_summary()
         ctx.session.state["search_summary"] = json.dumps(
             {
                 "total_mobius_logs": len(all_logs["mobius"]),
@@ -1358,6 +1826,7 @@ class ExhaustiveSearchAgent(BaseAgent):
                 "max_depth_reached": max_depth_reached,
                 "total_ids_searched": len(all_seen_ids),
                 "search_history": search_history,
+                "token_budget": budget_summary,
             },
             default=str,
         )
@@ -1379,24 +1848,29 @@ class ExhaustiveSearchAgent(BaseAgent):
             "all_logs": ctx.session.state["all_logs"],
             "search_summary": ctx.session.state["search_summary"],
         }
+        # Store rolling summary + chunk summaries for downstream analysis agents
+        ctx.session.state["chunk_summaries"] = json.dumps(chunk_summaries, default=str)
+        ctx.session.state["chunk_analysis_summary"] = rolling_summary
 
         logger.info(
-            f"[{self.name}] ══ Search complete ══\n"
+            f"[{self.name}] == Search complete ==\n"
             f"  Mobius:    {len(all_logs['mobius'])} logs\n"
             f"  SSE/MSE:  {len(all_logs['sse_mse'])} logs\n"
             f"  WxCAS:    {len(all_logs['wxcas'])} logs\n"
             f"  IDs searched: {len(all_seen_ids)}\n"
-            f"  Max depth:    {max_depth_reached}"
+            f"  Max depth:    {max_depth_reached}\n"
+            f"  Token budget: {budget_summary['run_tokens_used']}/{budget_summary['run_budget']} used"
         )
-        print(f"\n{'═'*60}")
-        print(f"✅ Search complete!")
+        print(f"\n{'='*60}")
+        print(f"  Search complete!")
         print(f"  Mobius:      {len(all_logs['mobius'])} logs")
         print(f"  SSE/MSE:    {len(all_logs['sse_mse'])} logs")
         print(f"  WxCAS:      {len(all_logs['wxcas'])} logs")
         print(f"  IDs searched: {len(all_seen_ids)}")
         print(f"  Max depth:    {max_depth_reached}")
+        print(f"  Token budget: {budget_summary['run_tokens_used']}/{budget_summary['run_budget']} used")
         print(f"  All IDs: {all_seen_ids}")
-        print(f"{'═'*60}")
+        print(f"{'='*60}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
