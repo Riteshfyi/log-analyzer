@@ -1,3 +1,5 @@
+import json
+import math
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -16,6 +18,15 @@ from analyze_agent_v2.agent import (
 )
 from search_agent_v2.agent import _log_cache
 
+_SERVICE_KEY_MAP = {
+    "mobius": "mobius_logs",
+    "sse_mse": "sse_mse_logs",
+    "sse": "sse_mse_logs",
+    "mse": "sse_mse_logs",
+    "wxcas": "wxcas_logs",
+    "sdk": "sdk_logs",
+}
+
 
 def _get_state_or_cache(tool_context: ToolContext, key: str) -> str:
     """Read from tool_context.state first; fall back to the module-level log cache."""
@@ -26,45 +37,74 @@ def _get_state_or_cache(tool_context: ToolContext, key: str) -> str:
     return _log_cache.get(session_id, {}).get(key, "")
 
 
-def get_raw_logs(service: str, tool_context: ToolContext) -> dict:
-    """Retrieve raw logs for a specific service from the current analysis.
+def _parse_log_entries(raw: str) -> list[dict]:
+    """Parse a JSON log string into a list of dicts, returning [] on failure."""
+    if not raw:
+        return []
+    try:
+        entries = json.loads(raw)
+        return entries if isinstance(entries, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def get_raw_logs(service: str, page: int, tool_context: ToolContext, page_size: int = 30) -> dict:
+    """Retrieve a paginated chunk of raw logs for a specific service.
+
+    Returns only one page at a time so the full log set is never loaded
+    into the LLM context. Call with page=1 for the first chunk, then
+    increment to get subsequent chunks.
 
     Args:
-        service: One of "mobius", "sse_mse", "wxcas", "sdk", or "all".
+        service: One of "mobius", "sse_mse", "wxcas", "sdk".
+                 Use "all" to get a count summary of all services (no log entries).
+        page: 1-based page number. Start with 1.
+        page_size: Number of log entries per page (default 30, max 50).
 
     Returns:
-        A dict with the requested logs, or an error if not available.
+        A dict with: entries (list), page, total_pages, total_entries, has_more.
     """
-    key_map = {
-        "mobius": "mobius_logs",
-        "sse_mse": "sse_mse_logs",
-        "sse": "sse_mse_logs",
-        "mse": "sse_mse_logs",
-        "wxcas": "wxcas_logs",
-        "sdk": "sdk_logs",
-    }
-
     service_lower = service.lower().strip()
+    page_size = max(1, min(page_size, 50))
 
     if service_lower == "all":
+        summary = {}
+        for svc, key in [("mobius", "mobius_logs"), ("sse_mse", "sse_mse_logs"),
+                         ("wxcas", "wxcas_logs"), ("sdk", "sdk_logs")]:
+            entries = _parse_log_entries(_get_state_or_cache(tool_context, key))
+            summary[svc] = len(entries)
         return {
-            "mobius_logs": _get_state_or_cache(tool_context, "mobius_logs"),
-            "sse_mse_logs": _get_state_or_cache(tool_context, "sse_mse_logs"),
-            "wxcas_logs": _get_state_or_cache(tool_context, "wxcas_logs"),
-            "sdk_logs": _get_state_or_cache(tool_context, "sdk_logs"),
+            "message": "Use get_raw_logs with a specific service name and page=1 to fetch entries.",
+            "log_counts": summary,
         }
 
-    state_key = key_map.get(service_lower)
+    state_key = _SERVICE_KEY_MAP.get(service_lower)
     if not state_key:
         return {
             "error": f"Unknown service '{service}'. Use one of: mobius, sse_mse, wxcas, sdk, all.",
         }
 
-    logs = _get_state_or_cache(tool_context, state_key)
-    if not logs:
-        return {"logs": "", "message": f"No {service} logs available in the current analysis."}
+    all_entries = _parse_log_entries(_get_state_or_cache(tool_context, state_key))
+    total = len(all_entries)
 
-    return {"logs": logs}
+    if total == 0:
+        return {"entries": [], "page": 1, "total_pages": 0,
+                "total_entries": 0, "has_more": False,
+                "message": f"No {service} logs available in the current analysis."}
+
+    total_pages = math.ceil(total / page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+    chunk = all_entries[start:end]
+
+    return {
+        "entries": chunk,
+        "page": page,
+        "total_pages": total_pages,
+        "total_entries": total,
+        "has_more": page < total_pages,
+    }
 
 
 def get_sequence_diagram(tool_context: ToolContext) -> dict:
@@ -124,9 +164,9 @@ Primary analysis (always in context):
 The following data is available ON-DEMAND via tools (not loaded
 into context by default — call the tool only when needed):
 
-  get_raw_logs(service)   — raw Mobius, SSE/MSE, WxCAS, or SDK logs
-  get_sequence_diagram()  — PlantUML sequence diagram
-  get_search_summary()    — search statistics (log counts, BFS depth, IDs)
+  get_raw_logs(service, page)  — paginated raw logs (one chunk at a time)
+  get_sequence_diagram()       — PlantUML sequence diagram
+  get_search_summary()         — search statistics (log counts, BFS depth, IDs)
 
 ================================================================
 RULE 0 — CONTEXT TRACKING (READ THIS FIRST)
@@ -246,26 +286,27 @@ Do NOT add your own diagnosis.
 
 ── RAW LOG REQUESTS ("show logs", "give me the raw Mobius logs") ──
 
-Call get_raw_logs(service) with the appropriate service name:
-  "mobius", "sse_mse", "wxcas", "sdk", or "all".
-If the user doesn't specify which service, ask:
-  "Which logs? Mobius, SSE/MSE, WxCAS, or SDK?"
-Return logs as received — preserve JSON, sort by @timestamp ascending.
+get_raw_logs is PAGINATED — it returns one chunk at a time, not all
+logs at once. This keeps context small and responses fast.
 
-**Chunking large log output:**
-When the logs returned by get_raw_logs are large (roughly more than
-50 log entries or the output would exceed ~4000 characters), you MUST
-split the output into sequential chunks instead of dumping everything
-at once. Follow this pattern:
+  get_raw_logs(service, page, page_size=30)
+    service:   "mobius", "sse_mse", "wxcas", "sdk", or "all"
+    page:      1-based page number (start with 1)
+    page_size: entries per page (default 30, max 50)
 
-  1. Tell the user the total count and that you will send in parts:
-     "Found **142 Mobius log entries**. Sending in chunks…"
-  2. Send the first chunk (roughly 30–50 entries) in a JSON code block.
-  3. End each chunk with: "**[Chunk 1/N]** — Reply 'next' or 'continue'
-     for the next batch, or 'stop' to end."
-  4. On each follow-up, send the next chunk until all logs are delivered.
-  5. If the user asks for ALL services at once, send one service at a
-     time (e.g. Mobius first, then SSE/MSE, etc.) with clear headers.
+  Returns: { entries, page, total_pages, total_entries, has_more }
+
+**Usage pattern:**
+  1. If user doesn't specify which service, ask:
+     "Which logs? Mobius, SSE/MSE, WxCAS, or SDK?"
+  2. Call get_raw_logs(service="mobius", page=1) for the first chunk.
+  3. Present the entries in a JSON code block.
+  4. Report pagination: "**[Page 1/N]** (30 of 142 entries).
+     Reply 'next' for the next page, or 'stop' to end."
+  5. When user says "next"/"continue", call with page=2, page=3, etc.
+  6. If user asks for "all" services, call get_raw_logs("all", page=1)
+     first to get the count per service, then fetch one service at a
+     time starting with page=1.
 
 ── DIAGRAM REQUESTS ("show diagram", "give PlantUML") ──
 

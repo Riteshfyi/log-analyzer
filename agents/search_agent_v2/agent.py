@@ -1578,7 +1578,7 @@ class ExhaustiveSearchAgent(BaseAgent):
 
         analysis_queue: asyncio.Queue = asyncio.Queue()
         analysis_task = asyncio.create_task(
-            run_analysis_consumer(queue=analysis_queue, budget=budget)
+            run_analysis_consumer(queue=analysis_queue)
         )
         logger.info(f"[{self.name}] Analysis consumer task started in background")
 

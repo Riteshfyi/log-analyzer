@@ -1,9 +1,13 @@
 """
 Incremental Map-Reduce Analysis — processes log batches as they arrive from search.
 
+MAP step invokes batch_analysis_agent (from agent.py) via ADK Runner, giving each
+batch the full power of calling_agent / contact_center_agent with skills and routing.
+A fresh session is created per batch to prevent memory growth.
+
 Exports a clean function interface consumed by search_agent_v2:
   - new_rolling_analysis()        → empty rolling state
-  - map_batch()                   → MAP: one batch + compact memory → structured JSON
+  - map_batch()                   → MAP: one batch via ADK Runner → structured JSON
   - reduce()                      → REDUCE: merge map output into rolling state
   - compress_analysis_summary()   → shrink rolling summary when it exceeds token cap
   - format_to_markdown()          → convert final rolling state to markdown report
@@ -15,119 +19,30 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
 import litellm
 from dotenv import load_dotenv
 from pathlib import Path
 
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 logger = logging.getLogger(__name__)
 
-# Re-use TokenBudget from search_agent_v2 (imported by callers, passed in as arg).
-# We only reference the type for documentation; no import needed at module level.
+from analyze_agent_v2.agent import batch_analysis_agent
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Skill References (loaded on-demand via tool calls)
+# ADK Runner setup (reused across all map_batch calls)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SKILLS_DIR = Path(__file__).parent / "skills"
-
-_SKILL_FILE_MAP = {
-    "lookup_mobius_error_codes": _SKILLS_DIR / "mobius-error-id-skill" / "references" / "mobius_error_ids.md",
-    "lookup_architecture": _SKILLS_DIR / "architecture-endpoints-skill" / "references" / "architecture_and_endpoints.md",
-    "lookup_sip_flows": _SKILLS_DIR / "sip-flow-skill" / "references" / "sip_flows.md",
-    "lookup_calling_flow": _SKILLS_DIR / "architecture-endpoints-skill" / "references" / "calling_flow.md",
-    "lookup_contact_center_flow": _SKILLS_DIR / "architecture-endpoints-skill" / "references" / "contact_center_flow.md",
-}
-
-_SKILL_CACHE: dict[str, str] = {}
-
-
-def _load_skill_reference(name: str) -> str:
-    """Load a skill reference file, with caching."""
-    if name in _SKILL_CACHE:
-        return _SKILL_CACHE[name]
-    path = _SKILL_FILE_MAP.get(name)
-    if not path or not path.exists():
-        return f"Reference '{name}' not found."
-    content = path.read_text(encoding="utf-8")
-    _SKILL_CACHE[name] = content
-    logger.info(f"[_load_skill_reference] Loaded {name}: {len(content)} chars")
-    return content
-
-
-_TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_mobius_error_codes",
-            "description": (
-                "Look up Mobius HTTP error codes and mobius-error codes "
-                "(e.g., 101, 102, 103, 403, 503). Returns detailed reference "
-                "with root cause direction, user impact, and what to check in logs. "
-                "Call this when you see mobius-error codes or unexpected HTTP status "
-                "codes from Mobius in the log batch."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_architecture",
-            "description": (
-                "Look up Webex Calling / Contact Center architecture: service roles "
-                "(Mobius, SSE, MSE, WxCAS, CPAPI, Mercury, WDM, U2C), signaling and "
-                "media paths, call types, multi-instance deployment, timers, failover. "
-                "Call this when you need to understand how services connect or what a "
-                "specific component does."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_sip_flows",
-            "description": (
-                "Look up SIP message flow references: call setup (INVITE transaction), "
-                "early media (183), hold/resume (re-INVITE), call transfer (REFER), "
-                "registration (REGISTER), SIP response codes, SDP negotiation, timers, "
-                "and common failure patterns. Call this when you see SIP messages in logs "
-                "and need to verify the expected flow or diagnose a SIP failure."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_calling_flow",
-            "description": (
-                "Look up WebRTC Calling end-to-end flow: signaling path, media path, "
-                "call types (WebRTC-to-WebRTC, WebRTC-to-PSTN, WebRTC-to-DeskPhone). "
-                "Call this when analyzing a standard calling flow."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_contact_center_flow",
-            "description": (
-                "Look up Contact Center architecture: Kamailio SIP proxy, RTMS, RAS, "
-                "health ping endpoints, Mobius timers, Kafka failover, inter-regional "
-                "failover. Call this when logs indicate a Contact Center flow."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-]
-
+_APP_NAME = "log-analyzer-incremental"
+_USER_ID = "incremental-pipeline"
 
 def _handle_tool_calls(tool_calls: list) -> list[dict]:
     """Execute tool calls and return tool result messages."""
@@ -226,107 +141,8 @@ def _parse_json_from_llm(raw: Any) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAP Step
+# MAP Step — invokes batch_analysis_agent via ADK Runner
 # ═══════════════════════════════════════════════════════════════════════════════
-
-_MAP_INSTRUCTION = """\
-You are an analysis agent with deep expertise in HTTP, WebRTC, \
-SIP protocols and their interactions. You will receive a BATCH of microservice log entries \
-(condensed JSON) and a PRIOR ANALYSIS SUMMARY from earlier batches.
-
-These logs come from a Webex Calling / Contact Center platform. You have access to \
-reference tools — use them when you need detailed knowledge:
-
-- **lookup_mobius_error_codes**: Call when you see `mobius-error` codes or unexpected HTTP \
-status codes from Mobius. Returns code-level root cause and debugging guidance.
-- **lookup_architecture**: Call when you need to understand service roles (Mobius, SSE, MSE, \
-WxCAS, CPAPI, Mercury, WDM, U2C), signaling/media paths, or how services interconnect.
-- **lookup_sip_flows**: Call when analyzing SIP messages (INVITE, BYE, REGISTER, re-INVITE, \
-REFER, etc.) and you need the expected sequence, SDP details, or failure patterns.
-- **lookup_calling_flow**: Call when analyzing an end-to-end calling flow (WebRTC-to-WebRTC, \
-WebRTC-to-PSTN, WebRTC-to-DeskPhone).
-- **lookup_contact_center_flow**: Call when logs indicate a Contact Center scenario (Kamailio, \
-RTMS, RAS, health pings, Kafka failover).
-
-## Output Schema
-
-Analyze THIS batch and produce a structured JSON object. \
-Output ONLY valid JSON — no markdown fences, no preamble.
-
-{
-  "new_identifiers": {
-    "session_ids": ["<localSessionId or remoteSessionId values>"],
-    "call_ids": ["<mobiusCallId values>"],
-    "sip_call_ids": ["<SIP Call-ID headers (UUID format)>"],
-    "sse_call_ids": ["<SSE Call-ID patterns like SSE0520...@IP>"],
-    "tracking_ids": ["<WEBEX_TRACKINGID values>"],
-    "user_ids": ["<USER_ID values>"],
-    "device_ids": ["<DEVICE_ID values>"],
-    "trace_ids": ["<trace/span IDs>"]
-  },
-  "events": [
-    {
-      "timestamp": "<ISO timestamp>",
-      "type": "HTTP|SIP|media|routing|registration|websocket|error",
-      "source": "<originating service: Mobius|SSE|MSE|WxCAS|Browser|CPAPI|Mercury>",
-      "destination": "<target service or endpoint>",
-      "detail": "<method, path, status code, SIP method/response, Call-ID, or description>"
-    }
-  ],
-  "errors": [
-    {
-      "timestamp": "<ISO timestamp>",
-      "code": "<HTTP status, SIP response code, mobius-error code>",
-      "service": "<Mobius|SSE|MSE|WxCAS|CPAPI>",
-      "message": "<error message text>",
-      "suspected_cause": "<root cause hypothesis — use lookup tools for specifics>"
-    }
-  ],
-  "state_updates": [
-    {
-      "timestamp": "<ISO timestamp>",
-      "transition": "<what changed>",
-      "from_state": "<previous state>",
-      "to_state": "<new state>"
-    }
-  ],
-  "evidence_refs": [
-    {
-      "doc_id": "<OpenSearch _id if available>",
-      "index": "<index name if available>",
-      "timestamp": "<log timestamp>",
-      "category": "mobius|sse_mse|wxcas",
-      "relevance": "<why this entry matters for debugging>"
-    }
-  ],
-  "delta_summary": "<2-4 sentence summary of what THIS batch reveals that is NEW compared to the prior summary>"
-}
-
-## Analysis Guidance
-
-Be THOROUGH and EXHAUSTIVE — every log entry matters for debugging.
-
-- **HTTP**: capture every request/response with timestamp, source→destination, method, \
-full path, status code, relevant IDs. Flag non-2xx responses. Note latency if visible.
-- **SIP**: capture INVITE, 100 Trying, 180 Ringing, 183 Session Progress, 200 OK, ACK, \
-BYE, CANCEL, UPDATE, re-INVITE, PRACK, REFER with Call-ID and CSeq. Extract SDP details \
-(codec, media type, ICE candidates) when visible. Identify retransmissions and timeouts. \
-Use **lookup_sip_flows** if you need to verify the expected sequence.
-- **Errors**: every non-2xx HTTP, every 4xx/5xx/6xx SIP, every mobius-error code, every \
-logged error/warning/exception. Use **lookup_mobius_error_codes** for Mobius-specific codes.
-- **State transitions**: call state changes (idle→calling→connected→disconnected), \
-registration state (unregistered→registered→expired), SIP dialog state, media negotiation.
-- **Cross-service correlation**: the SAME call appears in Mobius (HTTP side), SSE (SIP side), \
-and WxCAS (routing side) with shared IDs. Note when you see the same transaction across services. \
-Identify gaps. Use **lookup_architecture** if you need to understand the expected path.
-- **Timing**: note delays >2s between expected sequential events. Calculate setup time \
-(INVITE to 200 OK). Flag timeouts.
-- **Evidence**: mark log entries critical for debugging (errors, state changes, first/last events, \
-SIP milestones).
-- **delta_summary**: focus on what is NEW in this batch vs the prior summary — avoid repeating.
-
-If no items exist for a category, use an empty list [].
-"""
 
 _MAP_USER_TEMPLATE = """\
 ## Prior Analysis Summary
@@ -340,14 +156,17 @@ _MAP_USER_TEMPLATE = """\
 async def map_batch(
     condensed_hits: list[dict],
     compact_memory: str,
-    budget: "TokenBudget",
 ) -> dict:
-    """MAP step: analyze one batch of log entries via LLM.
+    """MAP step: analyze one batch of log entries via ADK Runner.
+
+    Creates a fresh session per batch to prevent memory growth, sends the
+    batch + compact_memory as a user message, and collects the structured
+    JSON response from the batch_analysis_agent (which routes to
+    calling_agent or contact_center_agent with full skills).
 
     Args:
         condensed_hits: list of condensed log entries (from extract_id_fields_for_llm)
         compact_memory: the rolling_analysis["summary"] from prior batches (few KB)
-        budget: TokenBudget instance for tracking/limiting token usage
 
     Returns:
         MapOutput dict matching the schema in _MAP_INSTRUCTION, or empty dict on failure.
@@ -360,82 +179,59 @@ async def map_batch(
         batch_json=batch_json,
     )
 
-    full_prompt = _MAP_INSTRUCTION + user_content
-    est_tokens = _estimate_tokens(full_prompt)
-
-    if budget and not budget.can_afford(full_prompt):
-        allowed_chars = (
-            budget.remaining_stage() * CHARS_PER_TOKEN_ESTIMATE
-            - len(_MAP_INSTRUCTION)
-            - len(_MAP_USER_TEMPLATE)
-            - len(compact_memory or "")
-            - 200
-        )
-        if allowed_chars < 500:
-            logger.warning("[map_batch] Budget too tight, skipping batch")
-            return {}
-        batch_json = batch_json[:allowed_chars]
-        user_content = _MAP_USER_TEMPLATE.format(
-            compact_memory=compact_memory or "(No prior analysis — this is the first batch)",
-            batch_json=batch_json,
-        )
-        logger.info(f"[map_batch] Trimmed batch for budget: {len(batch_json)} chars")
-
-    MAX_TOOL_ROUNDS = 3
-
-    messages = [
-        {"role": "system", "content": _MAP_INSTRUCTION},
-        {"role": "user", "content": user_content},
-    ]
+    session_id = f"batch-{uuid.uuid4().hex[:12]}"
 
     try:
-        for _round in range(MAX_TOOL_ROUNDS + 1):
-            response = await litellm.acompletion(
-                model="openai/gpt-4.1",
-                api_key=api_key,
-                api_base=api_base,
-                extra_headers={"x-cisco-app": "microservice-log-analyzer"},
-                messages=messages,
-                tools=_TOOL_DEFINITIONS,
-                tool_choice="auto",
-                temperature=0,
-            )
-            if budget:
-                budget.record_usage(est_tokens)
+        session = await _session_service.create_session(
+            app_name=_APP_NAME,
+            user_id=_USER_ID,
+            session_id=session_id,
+        )
 
-            choice = response.choices[0]
+        user_message = types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_content)],
+        )
 
-            if choice.finish_reason == "tool_calls" or (
-                choice.message.tool_calls and not choice.message.content
-            ):
-                tool_calls = choice.message.tool_calls
-                logger.info(
-                    f"[map_batch] Round {_round}: LLM requested "
-                    f"{len(tool_calls)} skill(s): "
-                    f"{[tc.function.name for tc in tool_calls]}"
-                )
-                messages.append(choice.message)
-                messages.extend(_handle_tool_calls(tool_calls))
-                continue
+        final_text = ""
+        async for event in _runner.run_async(
+            user_id=_USER_ID,
+            session_id=session.id,
+            new_message=user_message,
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        final_text = part.text
 
-            raw = choice.message.content or "{}"
-            result = _parse_json_from_llm(raw)
+        result = _parse_json_from_llm(final_text or "{}")
 
-            logger.info(
-                f"[map_batch] Extracted (after {_round} tool round(s)): "
-                f"events={len(result.get('events', []))}, "
-                f"errors={len(result.get('errors', []))}, "
-                f"state_updates={len(result.get('state_updates', []))}, "
-                f"evidence_refs={len(result.get('evidence_refs', []))}"
-            )
-            return result
+        logger.info(
+            f"[map_batch] ADK Runner result (session={session_id}): "
+            f"events={len(result.get('events', []))}, "
+            f"errors={len(result.get('errors', []))}, "
+            f"state_updates={len(result.get('state_updates', []))}, "
+            f"evidence_refs={len(result.get('evidence_refs', []))}"
+        )
+        return result
 
         logger.warning("[map_batch] Exhausted tool rounds, returning last response")
         return _parse_json_from_llm(response.choices[0].message.content or "{}")
 
     except Exception as e:
-        logger.error(f"[map_batch] LLM call failed: {e}")
+        logger.error(f"[map_batch] ADK Runner call failed: {e}")
         return {}
+    finally:
+        try:
+            await _session_service.delete_session(
+                app_name=_APP_NAME,
+                user_id=_USER_ID,
+                session_id=session_id,
+            )
+        except Exception:
+            pass
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -579,10 +375,7 @@ Output the compressed summary directly, no preamble or explanation.\
 """
 
 
-async def compress_analysis_summary(
-    rolling: dict,
-    budget: "TokenBudget",
-) -> dict:
+async def compress_analysis_summary(rolling: dict) -> dict:
     """Compress rolling_analysis['summary'] when it exceeds ROLLING_SUMMARY_TOKEN_CAP.
 
     Calls the LLM to produce a shorter version that preserves errors, IDs, and
@@ -617,11 +410,6 @@ async def compress_analysis_summary(
         compressed = response.choices[0].message.content or summary
         old_tokens = current_tokens
         new_tokens = _estimate_tokens(compressed)
-
-        if budget:
-            budget.record_usage(
-                _estimate_tokens(summary) + _estimate_tokens(_ANALYSIS_COMPRESS_INSTRUCTION)
-            )
 
         rolling["summary"] = compressed
         logger.info(
@@ -845,7 +633,6 @@ SENTINEL = None  # pushed by the producer to signal "no more batches"
 
 async def run_analysis_consumer(
     queue: "asyncio.Queue[list[dict] | None]",
-    budget: "TokenBudget",
     search_summary: str = "",
 ) -> tuple[str, dict, list[dict]]:
     """Consume condensed hit batches from an asyncio.Queue and run MAP-REDUCE.
@@ -858,7 +645,6 @@ async def run_analysis_consumer(
     Args:
         queue: asyncio.Queue fed by the search producer; items are
                list[dict] (condensed hits) or None (sentinel).
-        budget: TokenBudget instance shared with the caller.
         search_summary: optional search_summary string for the final markdown.
 
     Returns:
@@ -884,13 +670,13 @@ async def run_analysis_consumer(
 
         compact_memory = rolling["summary"]
 
-        map_output = await map_batch(condensed_hits, compact_memory, budget)
+        map_output = await map_batch(condensed_hits, compact_memory)
         if map_output:
             rolling, evidence_index = reduce(rolling, map_output, evidence_index)
 
         summary_tokens = _estimate_tokens(rolling.get("summary", ""))
         if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
-            rolling = await compress_analysis_summary(rolling, budget)
+            rolling = await compress_analysis_summary(rolling)
 
         queue.task_done()
 
@@ -912,7 +698,6 @@ _UPLOAD_BATCH_SIZE = 200
 
 async def analyze_upload_only(
     sdk_logs: str,
-    budget: "TokenBudget | None" = None,
 ) -> tuple[str, dict, list[dict]]:
     """Analyze SDK logs that were uploaded directly (no OpenSearch search).
 
@@ -921,7 +706,6 @@ async def analyze_upload_only(
 
     Args:
         sdk_logs: raw log text pasted or uploaded by the user.
-        budget: optional TokenBudget for controlling LLM spend.
 
     Returns:
         (markdown_report, rolling_analysis, evidence_index)
@@ -941,14 +725,14 @@ async def analyze_upload_only(
                      for i, line in enumerate(batch_lines)]
 
         compact_memory = rolling["summary"]
-        map_output = await map_batch(condensed, compact_memory, budget)
+        map_output = await map_batch(condensed, compact_memory)
 
         if map_output:
             rolling, evidence_index = reduce(rolling, map_output, evidence_index)
 
         summary_tokens = _estimate_tokens(rolling.get("summary", ""))
         if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
-            rolling = await compress_analysis_summary(rolling, budget)
+            rolling = await compress_analysis_summary(rolling)
 
     markdown = format_to_markdown(rolling, evidence_index, search_summary="(SDK log upload)")
     logger.info(
