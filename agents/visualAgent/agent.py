@@ -76,12 +76,21 @@ Place immediately after !theme plain:
 ✓ Example: participant "Webex SDK/Client" as Client #E3F2FD
 ✓ Example: participant "Mobius" as Mobius #BBDEFB
 
+**CRITICAL: ALL entities used in arrow messages MUST be declared as participants FIRST.**
+If the analysis mentions a device, user, or entity by a long ID (e.g. d8ac9405-e6c7-30e9-...),
+declare it as a participant with a short alias:
+✓ CORRECT: participant "Device d8ac9405" as Device #E8EAF6
+  Then use: Mobius -> Device: Start Client Event
+✗ WRONG: Mobius -> Device d8ac9405-e6c7-30e9-b60f-1613fe6f2986: Start Client Event
+  (spaces in name and undeclared participant cause syntax errors)
+
 ✗ FORBIDDEN (causes diagram type misdetection):
   - Using actor keyword: actor "Name" as Alias
   - Using entity, boundary, control, database, collections keywords
   - Using stereotypes: participant "Name" as Alias <<Stereotype>>
   - Empty angle brackets: participant "Name" as Alias <>
   - Missing color assignment: participant "Name" as Alias
+  - Using undeclared names in arrow messages
 
 **RULE 2a: Color Assignment (MANDATORY)**
 ALL participants MUST have direct color assignment:
@@ -104,8 +113,9 @@ Each arrow MUST be COMPLETE on ONE SINGLE LINE with SPACES around arrow:
   - No spaces: Client->Mobius (WRONG)
   - Double arrows: Client ->> Mobius (wrong notation)
   - Bidirectional: Client <-> Mobius (not supported)
-  - Multiple arrows on same line
+  - Multiple/chained arrows on same line: A -> B -[#00AA00]-> C (WRONG - use two separate lines)
   - Wrong spacing: Client- >Mobius or Client -> Mobius (uneven spaces)
+  - Undeclared participants: EVERY name in an arrow MUST be a declared participant alias
   - **CRITICAL:** Splitting message across lines (see below)
 
 **CRITICAL LINE BREAK RULE FOR ARROWS:**
@@ -198,6 +208,8 @@ endlegend
   - Missing endlegend
   - Not wrapping long values
   - Unescaped special characters breaking table
+  - Using backslash \ at end of a source line for line continuation (NOT valid PlantUML)
+  - Splitting a legend table row across multiple source lines
 
 **RULE 6: Color Codes (STRICT HEX FORMAT)**
 
@@ -446,6 +458,9 @@ Generate a PlantUML sequence diagram showing ALL components and interactions fro
 2. Splitting legend table rows across lines  
 3. Breaking IDs/URLs with line breaks
 4. Using actual line breaks instead of \n for display wrapping
+5. Using undeclared participant names in arrows — declare ALL entities first
+6. Chaining multiple arrows on one line (WRONG: A -> B -[#color]-> C — split into two lines)
+7. Using backslash \ at end of source line for continuation (NOT valid PlantUML — use \n inside strings)
 
 Return the PlantUML diagram now.'''
 )

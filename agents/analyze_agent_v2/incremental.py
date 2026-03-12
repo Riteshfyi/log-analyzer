@@ -650,120 +650,190 @@ def format_to_markdown(
     The output mirrors the section structure expected by downstream agents
     (sequence_diagram, chat_agent).
     """
-    sections = []
-
-    # ── Root Cause Analysis (errors) ──
-    sections.append("---\n### Root Cause Analysis")
+    lines: list[str] = []
     errors = rolling.get("errors", [])
+    timeline = rolling.get("timeline", [])
+    ids = rolling.get("identifiers", {})
+    summary = rolling.get("summary", "")
+
+    # ── Root Cause Analysis ──
+    lines.append("---")
+    lines.append("### Root Cause Analysis\n")
     if not errors:
-        sections.append(
-            "No errors or issues detected. The flow appears to have completed normally."
+        lines.append(
+            "No errors or issues detected. The flow appears to have completed normally.\n"
         )
     else:
-        for err in errors:
+        for i, err in enumerate(errors, 1):
             ts = err.get("timestamp", "unknown")
             code = err.get("code", "N/A")
             svc = err.get("service", "unknown")
             msg = err.get("message", "")
             cause = err.get("suspected_cause", "")
-            sections.append(
-                f"**[{ts}]**: {code}\n"
-                f"  **Service**: {svc}\n"
-                f"  **Description**: {msg}\n"
-                f"  **Suspected Root Cause**: {cause}"
-            )
+            ctx = err.get("context", "")
+            fix = err.get("suggested_fix", "")
+            impact = err.get("impact", "")
+
+            lines.append(f"**{i}. [{ts}]** — `{code}`\n")
+            lines.append("| Field | Detail |")
+            lines.append("|-------|--------|")
+            lines.append(f"| **Service** | {svc} |")
+            lines.append(f"| **Description** | {msg} |")
+            if ctx:
+                lines.append(f"| **Context** | {ctx} |")
+            lines.append(f"| **Root Cause** | {cause} |")
+            if fix:
+                lines.append(f"| **Suggested Fix** | {fix} |")
+            if impact:
+                lines.append(f"| **Impact** | {impact} |")
+            lines.append("")
 
     # ── Extracted Identifiers ──
-    sections.append("\n---\n### Extracted Identifiers")
-    ids = rolling.get("identifiers", {})
+    lines.append("---")
+    lines.append("### Extracted Identifiers\n")
     label_map = {
-        "session_ids": "Session ID",
+        "tracking_ids": "Tracking ID",
         "call_ids": "Call ID (Mobius)",
         "sip_call_ids": "Call ID (SIP)",
         "sse_call_ids": "Call ID (SSE)",
-        "tracking_ids": "Tracking ID",
+        "session_ids": "Session ID",
         "user_ids": "User ID",
         "device_ids": "Device ID",
         "trace_ids": "Trace ID",
     }
+    has_any_id = False
     for key, label in label_map.items():
         vals = ids.get(key, [])
         if vals:
-            sections.append(f"- **{label}**: {', '.join(vals)}")
-        else:
-            sections.append(f"- **{label}**: (not found)")
+            has_any_id = True
+            lines.append(f"- **{label}**: `{'`, `'.join(vals)}`")
+    if not has_any_id:
+        lines.append("No identifiers extracted.")
+    lines.append("")
 
     # ── Search Scope ──
     if search_summary:
-        sections.append("\n---\n### Search Scope")
-        sections.append(search_summary)
+        lines.append("---")
+        lines.append("### Search Scope\n")
+        lines.append(search_summary)
+        lines.append("")
 
     # ── Cross-Service Correlation ──
-    sections.append("\n---\n### Cross-Service Correlation")
+    lines.append("---")
+    lines.append("### Cross-Service Correlation\n")
     corrs = rolling.get("cross_service_correlations", [])
     if corrs:
         for c in corrs:
-            sections.append(f"- {c}")
+            lines.append(f"- {c}")
     else:
-        summary_text = rolling.get("summary", "")
-        if "cross" in summary_text.lower() or "correlat" in summary_text.lower():
-            sections.append("(See analysis summary below for cross-service details)")
+        if "cross" in summary.lower() or "correlat" in summary.lower():
+            lines.append("(See Final Outcome below for cross-service details)")
         else:
-            sections.append("No explicit cross-service correlations captured.")
+            lines.append("No explicit cross-service correlations captured.")
+    lines.append("")
 
     # ── Timing Analysis ──
-    sections.append("\n---\n### Timing Analysis")
-    timeline = rolling.get("timeline", [])
+    lines.append("---")
+    lines.append("### Timing Analysis\n")
     if timeline:
-        first = timeline[0].get("timestamp", "")
-        last = timeline[-1].get("timestamp", "")
-        sections.append(f"- **First event**: {first}")
-        sections.append(f"- **Last event**: {last}")
-        sections.append(f"- **Events captured**: {len(timeline)}")
+        first_ts = timeline[0].get("timestamp", "")
+        last_ts = timeline[-1].get("timestamp", "")
+        sip_evts = [e for e in timeline if e.get("type") == "SIP"]
+        http_evts = [e for e in timeline if e.get("type") == "HTTP"]
+        error_evts = [e for e in timeline if e.get("type") == "error"]
 
-        sip_events = [e for e in timeline if e.get("type") == "SIP"]
-        if sip_events:
-            sections.append(f"- **SIP messages**: {len(sip_events)}")
+        lines.append("| Metric | Value |")
+        lines.append("|--------|-------|")
+        lines.append(f"| **First event** | {first_ts} |")
+        lines.append(f"| **Last event** | {last_ts} |")
+        lines.append(f"| **Total events** | {len(timeline)} |")
+        if http_evts:
+            lines.append(f"| **HTTP requests** | {len(http_evts)} |")
+        if sip_evts:
+            lines.append(f"| **SIP messages** | {len(sip_evts)} |")
+        if error_evts:
+            lines.append(f"| **Error events** | {len(error_evts)} |")
     else:
-        sections.append("No timeline events captured.")
+        lines.append("No timeline events captured.")
+    lines.append("")
 
-    # ── Final Outcome (analysis summary) ──
-    sections.append("\n---\n### Final Outcome")
-    summary = rolling.get("summary", "")
+    # ── Final Outcome ──
+    lines.append("---")
+    lines.append("### Final Outcome\n")
     if summary:
-        sections.append(summary)
+        lines.append(summary)
     else:
-        sections.append("Analysis produced no summary.")
+        lines.append("Analysis produced no summary.")
+    lines.append("")
 
-    # ── Timeline (condensed) ──
+    # ── Communication Flow (split by protocol) ──
     if timeline:
-        sections.append("\n---\n### Communication Flow")
-        for event in timeline:
-            ts = event.get("timestamp", "?")
-            etype = event.get("type", "")
-            src = event.get("source", "?")
-            dst = event.get("destination", "?")
-            detail = event.get("detail", "")
-            sections.append(f"**[{ts}]** {src} -> {dst}: {etype} {detail}")
+        http_evts = [e for e in timeline if e.get("type") == "HTTP"]
+        sip_evts = [e for e in timeline if e.get("type") == "SIP"]
+        other_evts = [e for e in timeline if e.get("type") not in ("HTTP", "SIP")]
+
+        if http_evts:
+            lines.append("---")
+            lines.append(f"### HTTP Communication Flow ({len(http_evts)} requests)\n")
+            for ev in http_evts:
+                ts = ev.get("timestamp", "?")
+                src = ev.get("source", "?")
+                dst = ev.get("destination", "?")
+                detail = ev.get("detail", "")
+                lines.append(f"- **[{ts}]** {src} \u2192 {dst}: {detail}")
+            lines.append("")
+
+        if sip_evts:
+            lines.append("---")
+            lines.append(f"### SIP Communication Flow ({len(sip_evts)} messages)\n")
+            for ev in sip_evts:
+                ts = ev.get("timestamp", "?")
+                src = ev.get("source", "?")
+                dst = ev.get("destination", "?")
+                detail = ev.get("detail", "")
+                lines.append(f"- **[{ts}]** {src} \u2192 {dst}: {detail}")
+            lines.append("")
+
+        if other_evts:
+            lines.append("---")
+            lines.append(f"### Other Events ({len(other_evts)})\n")
+            for ev in other_evts:
+                ts = ev.get("timestamp", "?")
+                etype = ev.get("type", "")
+                src = ev.get("source", "?")
+                dst = ev.get("destination", "?")
+                detail = ev.get("detail", "")
+                lines.append(f"- **[{ts}]** `{etype}` {src} \u2192 {dst}: {detail}")
+            lines.append("")
 
     # ── Evidence References ──
     if evidence_index:
-        sections.append(f"\n---\n### Evidence Index ({len(evidence_index)} references)")
-        for i, ref in enumerate(evidence_index[:20], 1):
+        lines.append("---")
+        lines.append(f"### Evidence Index ({len(evidence_index)} references)\n")
+        display_refs = evidence_index[:25]
+        lines.append("| # | Doc ID | Index | Category | Timestamp | Relevance |")
+        lines.append("|---|--------|-------|----------|-----------|-----------|")
+        for i, ref in enumerate(display_refs, 1):
             doc_id = ref.get("doc_id", "?")
             idx = ref.get("index", "?")
             ts = ref.get("timestamp", "?")
             cat = ref.get("category", "?")
             rel = ref.get("relevance", "")
-            sections.append(f"{i}. `{doc_id}` ({idx}, {cat}) [{ts}] — {rel}")
-        if len(evidence_index) > 20:
-            sections.append(f"  ... and {len(evidence_index) - 20} more references")
+            lines.append(f"| {i} | `{doc_id}` | {idx} | {cat} | {ts} | {rel} |")
+        if len(evidence_index) > 25:
+            lines.append(f"\n*... and {len(evidence_index) - 25} more references*")
+        lines.append("")
 
     # ── Stats ──
-    sections.append(f"\n---\n*Analysis: {rolling.get('batch_count', 0)} batches processed, "
-                    f"{rolling.get('evidence_count', 0)} evidence references collected.*")
+    lines.append("---")
+    lines.append(
+        f"*Analysis: {rolling.get('batch_count', 0)} batches processed, "
+        f"{len(errors)} errors found, "
+        f"{len(timeline)} events captured, "
+        f"{rolling.get('evidence_count', 0)} evidence references collected.*"
+    )
 
-    return "\n".join(sections)
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

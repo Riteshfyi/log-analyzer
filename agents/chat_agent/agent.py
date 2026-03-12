@@ -251,8 +251,21 @@ Call get_raw_logs(service) with the appropriate service name:
 If the user doesn't specify which service, ask:
   "Which logs? Mobius, SSE/MSE, WxCAS, or SDK?"
 Return logs as received — preserve JSON, sort by @timestamp ascending.
-If user asks for ALL logs, warn: "This is a large output. Continue?"
-  then call get_raw_logs("all").
+
+**Chunking large log output:**
+When the logs returned by get_raw_logs are large (roughly more than
+50 log entries or the output would exceed ~4000 characters), you MUST
+split the output into sequential chunks instead of dumping everything
+at once. Follow this pattern:
+
+  1. Tell the user the total count and that you will send in parts:
+     "Found **142 Mobius log entries**. Sending in chunks…"
+  2. Send the first chunk (roughly 30–50 entries) in a JSON code block.
+  3. End each chunk with: "**[Chunk 1/N]** — Reply 'next' or 'continue'
+     for the next batch, or 'stop' to end."
+  4. On each follow-up, send the next chunk until all logs are delivered.
+  5. If the user asks for ALL services at once, send one service at a
+     time (e.g. Mobius first, then SSE/MSE, etc.) with clear headers.
 
 ── DIAGRAM REQUESTS ("show diagram", "give PlantUML") ──
 
