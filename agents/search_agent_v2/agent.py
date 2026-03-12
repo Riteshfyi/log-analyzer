@@ -33,6 +33,12 @@ from google.adk.agents import LlmAgent, BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 from google.adk.models.lite_llm import LiteLlm
+
+from analyze_agent_v2.incremental import (
+    run_analysis_consumer,
+    format_to_markdown,
+    SENTINEL,
+)
 from opensearchpy import OpenSearch, RequestsHttpConnection
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1381,6 +1387,7 @@ class ExhaustiveSearchAgent(BaseAgent):
         rolling_summary: str,
         budget: TokenBudget,
         id_extractor_instruction: str,
+        analysis_queue: "asyncio.Queue | None" = None,
     ) -> tuple[str, dict, int]:
         """
         Process a page of hits: deduplicate, extract IDs, summarize, update rolling summary.
@@ -1414,6 +1421,13 @@ class ExhaustiveSearchAgent(BaseAgent):
             f"[_process_hits_progressive] Condensed {len(new_hits)} hits -> "
             f"{len(condensed)} entries for LLM"
         )
+
+        if analysis_queue is not None:
+            await analysis_queue.put(condensed)
+            logger.info(
+                f"[_process_hits_progressive] Pushed {len(condensed)} entries "
+                f"to analysis queue"
+            )
 
         # Run ID extraction + summarization in parallel, respecting budget
         extracted, batch_summary = await asyncio.gather(
@@ -1547,7 +1561,7 @@ class ExhaustiveSearchAgent(BaseAgent):
         )
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 2: Initialize BFS + Token Budget
+        # Step 2: Initialize BFS + Token Budget + Analysis Queue
         # ══════════════════════════════════════════════════════════════════════
         budget = TokenBudget()
         all_seen_ids: set[str] = set()
@@ -1561,6 +1575,12 @@ class ExhaustiveSearchAgent(BaseAgent):
         max_depth_reached = 0
         TIME_PADDING_HOURS = 2
         derived_time_range: tuple[str, str] | None = None
+
+        analysis_queue: asyncio.Queue = asyncio.Queue()
+        analysis_task = asyncio.create_task(
+            run_analysis_consumer(queue=analysis_queue, budget=budget)
+        )
+        logger.info(f"[{self.name}] Analysis consumer task started in background")
 
         for ident in identifiers:
             id_val = ident["value"]
@@ -1685,6 +1705,7 @@ class ExhaustiveSearchAgent(BaseAgent):
                         rolling_summary=rolling_summary,
                         budget=budget,
                         id_extractor_instruction=self.id_extractor.instruction,
+                        analysis_queue=analysis_queue,
                     )
                     depth_new_hits += new_count
 
@@ -1729,10 +1750,11 @@ class ExhaustiveSearchAgent(BaseAgent):
                 f"in {_search_elapsed:.2f}s"
             )
 
+            _log_counts = {k: len(v) for k, v in all_logs.items()}
             logger.info(
                 f"[{self.name}] Depth {current_depth} search phase done: "
                 f"depth_new_hits={depth_new_hits}, derived_time_range={derived_time_range}, "
-                f"all_logs counts={{ {k}: {len(v)} for k, v in all_logs.items() }}, "
+                f"all_logs counts={_log_counts}, "
                 f"seen_hit_ids={len(seen_hit_ids)}, budget_stage={budget.remaining_stage()}, "
                 f"budget_run={budget.remaining_run()}"
             )
@@ -1805,6 +1827,24 @@ class ExhaustiveSearchAgent(BaseAgent):
             budget.end_stage()
 
         # ══════════════════════════════════════════════════════════════════════
+        # Step 3.5: Signal analysis consumer to finish and await results
+        # ══════════════════════════════════════════════════════════════════════
+        await analysis_queue.put(SENTINEL)
+        logger.info(f"[{self.name}] Sent sentinel to analysis consumer, awaiting results...")
+        try:
+            analysis_markdown, analysis_rolling, analysis_evidence = await analysis_task
+            logger.info(
+                f"[{self.name}] Analysis consumer finished: "
+                f"{analysis_rolling.get('batch_count', 0)} batches, "
+                f"{len(analysis_evidence)} evidence refs"
+            )
+        except Exception as e:
+            logger.error(f"[{self.name}] Analysis consumer failed: {e}")
+            analysis_markdown = ""
+            analysis_rolling = {}
+            analysis_evidence = []
+
+        # ══════════════════════════════════════════════════════════════════════
         # Step 4: Store final results in session state
         # ══════════════════════════════════════════════════════════════════════
         logger.info(f"[{self.name}] Step 4: Storing final results in session state")
@@ -1851,6 +1891,17 @@ class ExhaustiveSearchAgent(BaseAgent):
         # Store rolling summary + chunk summaries for downstream analysis agents
         ctx.session.state["chunk_summaries"] = json.dumps(chunk_summaries, default=str)
         ctx.session.state["chunk_analysis_summary"] = rolling_summary
+
+        # Re-format analysis markdown now that search_summary is available
+        if analysis_rolling:
+            analysis_markdown = format_to_markdown(
+                analysis_rolling,
+                analysis_evidence,
+                search_summary=ctx.session.state.get("search_summary", ""),
+            )
+        ctx.session.state["analyze_results"] = analysis_markdown
+        ctx.session.state["analysis_evidence"] = json.dumps(analysis_evidence, default=str)
+        _log_cache[ctx.session.id]["analyze_results"] = analysis_markdown
 
         logger.info(
             f"[{self.name}] == Search complete ==\n"

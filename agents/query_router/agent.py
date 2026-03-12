@@ -15,7 +15,7 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 from root_agent_v2.agent import root_agent as pipeline
-from analyze_agent_v2.agent import analyze_agent
+from analyze_agent_v2.incremental import analyze_upload_only
 from visualAgent.agent import sequence_diagram_agent
 
 logger = logging.getLogger(__name__)
@@ -415,10 +415,12 @@ class QueryAnalyzerAgent(BaseAgent):
 
             # Store SDK logs if uploaded
             if upload_only:
-                ctx.session.state["sdk_logs"] = search_params.get("sdk_logs", "")
-                logger.info("[query_analyzer] Upload-only mode — skipping search, running analyze + visualize")
-                async for event in analyze_agent.run_async(ctx):
-                    yield event
+                sdk_logs = search_params.get("sdk_logs", "")
+                ctx.session.state["sdk_logs"] = sdk_logs
+                logger.info("[query_analyzer] Upload-only mode — running incremental analysis + visualize")
+                markdown, _rolling, _evidence = await analyze_upload_only(sdk_logs)
+                ctx.session.state["analyze_results"] = markdown
+                ctx.session.state["analysis_evidence"] = json.dumps(_evidence, default=str)
                 async for event in sequence_diagram_agent.run_async(ctx):
                     yield event
             else:

@@ -1,7 +1,8 @@
 """
-Root Agent v2 — Sequential pipeline using search_agent_v2 and analyze_agent_v2.
+Root Agent v2 — Sequential pipeline: search (with inline incremental analysis)
+then sequence diagram generation.
 
-Pipeline: search_agent_v2 → analyze_agent_v2 → sequence_diagram_agent
+Pipeline: search_agent_v2 (includes map-reduce analysis) → sequence_diagram_agent
 
 Run standalone:  adk web agents/root_agent_v2
 """
@@ -18,15 +19,10 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# OAuth Token Initialization — DISABLED (token provided via Webex OAuth login)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Import sub-agents
 # ═══════════════════════════════════════════════════════════════════════════════
 
 from search_agent_v2.agent import search_agent
-from analyze_agent_v2.agent import analyze_agent
 from visualAgent.agent import sequence_diagram_agent
 
 logging.info("✓ root_agent_v2: All sub-agents imported successfully")
@@ -37,10 +33,10 @@ logging.info("✓ root_agent_v2: All sub-agents imported successfully")
 
 root_agent = SequentialAgent(
     name="MicroserviceLogAnalyzerV2",
-    sub_agents=[search_agent, analyze_agent, sequence_diagram_agent],
+    sub_agents=[search_agent, sequence_diagram_agent],
     description=(
         "Executes a full log analysis pipeline: "
-        "exhaustive BFS search → analysis (calling/contact-center routing) → "
+        "exhaustive BFS search with inline incremental analysis → "
         "PlantUML sequence diagram generation."
     ),
 )
