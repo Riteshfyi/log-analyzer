@@ -45,6 +45,13 @@ from analyze_agent_v2.agent import batch_analysis_agent
 _APP_NAME = "log-analyzer-incremental"
 _USER_ID = "incremental-pipeline"
 
+_session_service = InMemorySessionService()
+_runner = Runner(
+    agent=batch_analysis_agent,
+    app_name=_APP_NAME,
+    session_service=_session_service,
+)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -601,6 +608,7 @@ SENTINEL = None  # pushed by the producer to signal "no more batches"
 async def run_analysis_consumer(
     queue: "asyncio.Queue[list[dict] | None]",
     search_summary: str = "",
+    sdk_logs: str = "",
 ) -> tuple[str, dict, list[dict]]:
     """Consume condensed hit batches from an asyncio.Queue and run MAP-REDUCE.
 
@@ -609,6 +617,10 @@ async def run_analysis_consumer(
     them one-at-a-time with map_batch -> reduce, compressing the summary when
     it exceeds the token cap.
 
+    After all search batches are consumed, if sdk_logs is provided the consumer
+    chunks them and processes those batches too — building a unified
+    rolling_analysis covering both data sources.
+
     A single temporary ADK session is created for the entire analysis run and
     destroyed when the consumer finishes (or on error).
 
@@ -616,6 +628,7 @@ async def run_analysis_consumer(
         queue: asyncio.Queue fed by the search producer; items are
                list[dict] (condensed hits) or None (sentinel).
         search_summary: optional search_summary string for the final markdown.
+        sdk_logs: optional raw SDK log text to analyze after search batches.
 
     Returns:
         (markdown_report, rolling_analysis, evidence_index)
@@ -633,17 +646,19 @@ async def run_analysis_consumer(
 
     try:
         batch_num = 0
+
+        # Phase 1: consume search batches from the queue
         while True:
             item = await queue.get()
             if item is SENTINEL:
                 queue.task_done()
-                logger.info("[analysis_consumer] Received sentinel, finishing analysis")
+                logger.info("[analysis_consumer] Received sentinel, search batches done")
                 break
 
             batch_num += 1
             condensed_hits = item
             logger.info(
-                f"[analysis_consumer] Processing batch {batch_num} "
+                f"[analysis_consumer] Processing search batch {batch_num} "
                 f"({len(condensed_hits)} entries)"
             )
 
@@ -658,6 +673,30 @@ async def run_analysis_consumer(
                 rolling = await compress_analysis_summary(rolling)
 
             queue.task_done()
+
+        # Phase 2: chunk and process SDK logs (if provided)
+        sdk_batches = chunk_sdk_logs(sdk_logs)
+        if sdk_batches:
+            logger.info(
+                f"[analysis_consumer] Processing {len(sdk_batches)} SDK log batches "
+                f"({sum(len(b) for b in sdk_batches)} lines)"
+            )
+            for condensed in sdk_batches:
+                batch_num += 1
+                logger.info(
+                    f"[analysis_consumer] Processing SDK batch {batch_num} "
+                    f"({len(condensed)} entries)"
+                )
+
+                compact_memory = rolling["summary"]
+                map_output = await map_batch(condensed, compact_memory, session_id)
+                if map_output:
+                    rolling, evidence_index = reduce(rolling, map_output, evidence_index)
+
+                summary_tokens = _estimate_tokens(rolling.get("summary", ""))
+                if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
+                    rolling = await compress_analysis_summary(rolling)
+
     finally:
         try:
             await _session_service.delete_session(
@@ -685,6 +724,25 @@ async def run_analysis_consumer(
 _UPLOAD_BATCH_SIZE = 200
 
 
+def chunk_sdk_logs(sdk_logs: str, batch_size: int = _UPLOAD_BATCH_SIZE) -> list[list[dict]]:
+    """Split raw SDK log text into batches of condensed dicts.
+
+    Each dict has {"raw_line": <line text>, "line_num": <1-based line number>}.
+    Returns an empty list if sdk_logs is blank.
+    """
+    if not sdk_logs or not sdk_logs.strip():
+        return []
+    lines = sdk_logs.strip().splitlines()
+    batches: list[list[dict]] = []
+    for start in range(0, len(lines), batch_size):
+        batch_lines = lines[start : start + batch_size]
+        batches.append([
+            {"raw_line": line, "line_num": start + i + 1}
+            for i, line in enumerate(batch_lines)
+        ])
+    return batches
+
+
 async def analyze_upload_only(
     sdk_logs: str,
 ) -> tuple[str, dict, list[dict]]:
@@ -700,11 +758,11 @@ async def analyze_upload_only(
     Returns:
         (markdown_report, rolling_analysis, evidence_index)
     """
-    if not sdk_logs or not sdk_logs.strip():
+    batches = chunk_sdk_logs(sdk_logs)
+    if not batches:
         return "(No SDK logs provided)", new_rolling_analysis(), []
 
-    lines = sdk_logs.strip().splitlines()
-    logger.info(f"[analyze_upload_only] Processing {len(lines)} lines of SDK logs")
+    logger.info(f"[analyze_upload_only] Processing {sum(len(b) for b in batches)} lines in {len(batches)} batches")
 
     rolling = new_rolling_analysis()
     evidence_index: list[dict] = []
@@ -718,11 +776,7 @@ async def analyze_upload_only(
     logger.info(f"[analyze_upload_only] Created shared session {session_id}")
 
     try:
-        for start in range(0, len(lines), _UPLOAD_BATCH_SIZE):
-            batch_lines = lines[start : start + _UPLOAD_BATCH_SIZE]
-            condensed = [{"raw_line": line, "line_num": start + i + 1}
-                         for i, line in enumerate(batch_lines)]
-
+        for condensed in batches:
             compact_memory = rolling["summary"]
             map_output = await map_batch(condensed, compact_memory, session_id)
 
