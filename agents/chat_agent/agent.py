@@ -8,6 +8,8 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 
+from oauth_context import SessionLiteLlm
+
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
@@ -132,9 +134,9 @@ def get_search_summary(tool_context: ToolContext) -> dict:
 
 
 chat_agent = LlmAgent(
-    model=LiteLlm(
+    model=SessionLiteLlm(
         model="openai/gpt-4.1",
-        api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or "pending-oauth",
+        api_key="pending-oauth",
         api_base=os.environ["AZURE_OPENAI_ENDPOINT"],
         extra_headers={"x-cisco-app": "microservice-log-analyzer"},
     ),

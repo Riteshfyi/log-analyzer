@@ -21,7 +21,6 @@ import requests
 from collections import deque
 
 _log_cache: dict[str, dict[str, str]] = {}
-from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 from typing_extensions import override
@@ -40,6 +39,8 @@ from analyze_agent_v2.incremental import (
     SENTINEL,
 )
 from opensearchpy import OpenSearch, RequestsHttpConnection
+
+from oauth_context import SessionLiteLlm, get_oauth_token
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Setup
@@ -457,179 +458,11 @@ EXTRACTOR_KEY_TO_ID_TYPE = {
     "trace_ids": "trace_id",
 }
 
-# Chunk size for map-reduce ID extraction (entries per LLM call)
-MAPREDUCE_CHUNK_SIZE = 200
-
 # Regex for SSE Call-ID pattern in SIP message bodies
 SSE_CALLID_PATTERN = re.compile(r"SSE\d+@[\d.]+")
 
 # Pagination
 PAGE_SIZE = 100
-
-# Token budget caps
-TOKEN_BUDGET_PER_CALL = 16_000    # Max input tokens per single LLM call
-TOKEN_BUDGET_PER_STAGE = 60_000   # Max input tokens per search stage
-TOKEN_BUDGET_PER_RUN = 180_000    # Max input tokens per entire search run
-CHARS_PER_TOKEN_ESTIMATE = 4      # Rough chars-per-token for estimation
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Token Budget Manager
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _estimate_tokens(text: str) -> int:
-    """Estimate token count from character length."""
-    return len(text) // CHARS_PER_TOKEN_ESTIMATE
-
-
-_COMPRESS_INSTRUCTION = """You are a log analysis compressor. You are given a rolling summary of microservice log analysis that has grown too large.
-
-Compress it to approximately HALF its current length while preserving:
-1. ALL unresolved errors, their timestamps, and error codes
-2. ALL correlation-critical IDs (session IDs, call IDs, tracking IDs that link services)
-3. Key timeline events (first event, last event, error events)
-4. Cross-service correlation evidence
-
-You MAY remove or abbreviate:
-- Redundant success confirmations
-- Detailed descriptions of normal/expected behavior
-- Verbose HTTP request/response details for successful calls
-- Duplicate information that appears in multiple summaries
-
-Output the compressed summary directly, no preamble."""
-
-
-_SUMMARIZER_INSTRUCTION = """You are a log analysis summarizer. Analyze the provided log entries and produce a concise summary focusing on:
-1. Key events and their timestamps
-2. Errors, warnings, and anomalies
-3. Service interactions (which services communicated, request/response pairs)
-4. Relevant IDs found (session IDs, call IDs, tracking IDs, etc.)
-5. SIP message flows if present
-6. HTTP request/response patterns
-
-Be specific with timestamps, status codes, and error messages. This summary will be used for further analysis."""
-
-
-@dataclass
-class TokenBudget:
-    """
-    Tracks token consumption across a search run with three budget levels.
-
-    Usage:
-        budget = TokenBudget()
-        budget.begin_stage("mobius")
-        if not budget.can_afford(prompt_text):
-            summary = await budget.compress_summary(current_summary)
-        budget.record_usage(prompt_tokens)
-        budget.end_stage()
-    """
-    per_call_cap: int = TOKEN_BUDGET_PER_CALL
-    per_stage_cap: int = TOKEN_BUDGET_PER_STAGE
-    per_run_cap: int = TOKEN_BUDGET_PER_RUN
-
-    run_tokens_used: int = 0
-    stage_tokens_used: int = 0
-    current_stage: str = ""
-
-    stage_history: list = dataclass_field(default_factory=list)
-
-    def begin_stage(self, stage_name: str) -> None:
-        if self.current_stage:
-            self.stage_history.append({
-                "stage": self.current_stage,
-                "tokens_used": self.stage_tokens_used,
-            })
-        self.current_stage = stage_name
-        self.stage_tokens_used = 0
-        logger.info(
-            f"[TokenBudget] Starting stage '{stage_name}' "
-            f"(run total: {self.run_tokens_used}/{self.per_run_cap})"
-        )
-
-    def end_stage(self) -> None:
-        if self.current_stage:
-            self.stage_history.append({
-                "stage": self.current_stage,
-                "tokens_used": self.stage_tokens_used,
-            })
-            logger.info(
-                f"[TokenBudget] Stage '{self.current_stage}' complete: "
-                f"{self.stage_tokens_used} tokens"
-            )
-            self.current_stage = ""
-            self.stage_tokens_used = 0
-
-    def record_usage(self, tokens: int) -> None:
-        self.run_tokens_used += tokens
-        self.stage_tokens_used += tokens
-
-    def can_afford(self, text: str) -> bool:
-        est = _estimate_tokens(text)
-        if est > self.per_call_cap:
-            logger.warning(f"[TokenBudget] Call would exceed per-call cap: {est} > {self.per_call_cap}")
-            return False
-        if self.stage_tokens_used + est > self.per_stage_cap:
-            logger.warning(f"[TokenBudget] Call would exceed per-stage cap: {self.stage_tokens_used + est} > {self.per_stage_cap}")
-            return False
-        if self.run_tokens_used + est > self.per_run_cap:
-            logger.warning(f"[TokenBudget] Call would exceed per-run cap: {self.run_tokens_used + est} > {self.per_run_cap}")
-            return False
-        return True
-
-    def remaining_run(self) -> int:
-        return max(0, self.per_run_cap - self.run_tokens_used)
-
-    def remaining_stage(self) -> int:
-        return max(0, self.per_stage_cap - self.stage_tokens_used)
-
-    async def compress_summary(self, summary: str) -> str:
-        if not summary or len(summary) < 500:
-            return summary
-
-        logger.info(
-            f"[TokenBudget] Compressing summary: "
-            f"{_estimate_tokens(summary)} tokens -> target ~{_estimate_tokens(summary) // 2}"
-        )
-
-        api_key = (
-            os.environ.get("OPENAI_API_KEY")
-            or os.environ.get("AZURE_OPENAI_API_KEY")
-            or "pending-oauth"
-        )
-        api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
-
-        try:
-            response = await litellm.acompletion(
-                model="openai/gpt-4.1",
-                api_key=api_key,
-                api_base=api_base,
-                extra_headers={"x-cisco-app": "microservice-log-analyzer"},
-                messages=[
-                    {"role": "system", "content": _COMPRESS_INSTRUCTION},
-                    {"role": "user", "content": summary},
-                ],
-                temperature=0,
-            )
-            compressed = response.choices[0].message.content or summary
-            savings = _estimate_tokens(summary) - _estimate_tokens(compressed)
-            logger.info(f"[TokenBudget] Compressed: saved ~{savings} tokens")
-            self.record_usage(_estimate_tokens(summary) + _estimate_tokens(_COMPRESS_INSTRUCTION))
-            return compressed
-        except Exception as e:
-            logger.error(f"[TokenBudget] Compression failed: {e}")
-            return summary
-
-    def get_summary(self) -> dict:
-        return {
-            "run_tokens_used": self.run_tokens_used,
-            "run_budget": self.per_run_cap,
-            "run_remaining": self.remaining_run(),
-            "stages": self.stage_history + (
-                [{"stage": self.current_stage, "tokens_used": self.stage_tokens_used}]
-                if self.current_stage else []
-            ),
-        }
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helper Functions
@@ -673,159 +506,14 @@ def _parse_json_from_llm(raw: Any) -> dict:
     return {}
 
 
-async def _extract_ids_mapreduce(
-    condensed: list[dict],
-    instruction: str,
-) -> dict:
-    """
-    Map-reduce ID extraction: split condensed log entries into chunks,
-    call the LLM in parallel for each chunk, then merge results.
-    """
-    id_keys = [
-        "session_ids", "tracking_ids", "mobius_call_ids", "sip_call_ids",
-        "sse_call_ids", "call_ids", "user_ids", "device_ids", "trace_ids",
-    ]
-
-    if not condensed:
-        return {k: [] for k in id_keys}
-
-    # Split into chunks
-    chunks = []
-    for i in range(0, len(condensed), MAPREDUCE_CHUNK_SIZE):
-        chunks.append(condensed[i : i + MAPREDUCE_CHUNK_SIZE])
-
-    logger.info(
-        f"[_extract_ids_mapreduce] Splitting {len(condensed)} entries "
-        f"into {len(chunks)} chunks of ~{MAPREDUCE_CHUNK_SIZE}"
-    )
-
-    # Build litellm call params from environment (mirrors _make_model)
-    api_key = (
-        os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("AZURE_OPENAI_API_KEY")
-        or "pending-oauth"
-    )
-    api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
-
-    async def _call_chunk(chunk: list[dict], chunk_idx: int) -> dict:
-        user_content = json.dumps(chunk, default=str)
-        logger.debug(
-            f"[_extract_ids_mapreduce] Chunk {chunk_idx}: "
-            f"{len(chunk)} entries, ~{len(user_content)} chars"
-        )
-        try:
-            response = await litellm.acompletion(
-                model="openai/gpt-4.1",
-                api_key=api_key,
-                api_base=api_base,
-                extra_headers={"x-cisco-app": "microservice-log-analyzer"},
-                messages=[
-                    {"role": "system", "content": instruction},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0,
-            )
-            raw = response.choices[0].message.content
-            parsed = _parse_json_from_llm(raw)
-            logger.info(
-                f"[_extract_ids_mapreduce] Chunk {chunk_idx} returned "
-                f"{sum(len(v) for v in parsed.values() if isinstance(v, list))} IDs"
-            )
-            return parsed
-        except Exception as e:
-            logger.error(
-                f"[_extract_ids_mapreduce] Chunk {chunk_idx} failed: {e}"
-            )
-            return {}
-
-    # Map phase: call all chunks in parallel
-    chunk_results = await asyncio.gather(
-        *[_call_chunk(chunk, i) for i, chunk in enumerate(chunks)]
-    )
-
-    # Reduce phase: merge and deduplicate
-    merged: dict[str, list[str]] = {k: [] for k in id_keys}
-    seen: dict[str, set[str]] = {k: set() for k in id_keys}
-    for result in chunk_results:
-        for key in id_keys:
-            vals = result.get(key, [])
-            if isinstance(vals, str):
-                vals = [vals]
-            for v in vals:
-                v = str(v).strip()
-                if v and v not in seen[key]:
-                    seen[key].add(v)
-                    merged[key].append(v)
-
-    total = sum(len(v) for v in merged.values())
-    logger.info(f"[_extract_ids_mapreduce] Merged result: {total} unique IDs")
-    return merged
-
-
-async def _summarize_hits(
-    condensed: list[dict],
-    budget: TokenBudget | None = None,
-) -> str:
-    """Summarize a batch of condensed log entries for the rolling summary."""
-    api_key = (
-        os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("AZURE_OPENAI_API_KEY")
-        or "pending-oauth"
-    )
-    api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
-    user_content = json.dumps(condensed, default=str)
-
-    full_prompt = _SUMMARIZER_INSTRUCTION + user_content
-    if budget and not budget.can_afford(full_prompt):
-        allowed_chars = budget.remaining_stage() * CHARS_PER_TOKEN_ESTIMATE - len(_SUMMARIZER_INSTRUCTION)
-        if allowed_chars < 500:
-            logger.warning("[_summarize_hits] Budget too tight, skipping summarization")
-            return "[Batch skipped due to token budget]"
-        user_content = user_content[:allowed_chars]
-        logger.info(f"[_summarize_hits] Trimmed for budget: {len(user_content)} chars")
-
-    try:
-        response = await litellm.acompletion(
-            model="openai/gpt-4.1",
-            api_key=api_key,
-            api_base=api_base,
-            extra_headers={"x-cisco-app": "microservice-log-analyzer"},
-            messages=[
-                {"role": "system", "content": _SUMMARIZER_INSTRUCTION},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0,
-        )
-        if budget:
-            budget.record_usage(_estimate_tokens(full_prompt))
-        return response.choices[0].message.content or ""
-    except Exception as e:
-        logger.error(f"[_summarize_hits] Summarization failed: {e}")
-        return "[Summarization failed]"
-
-
 async def _extract_ids_from_batch(
     condensed: list[dict],
     instruction: str,
-    budget: TokenBudget | None = None,
 ) -> dict:
-    """Extract IDs from a single batch of condensed entries, respecting budget."""
-    api_key = (
-        os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("AZURE_OPENAI_API_KEY")
-        or "pending-oauth"
-    )
+    """Extract IDs from a single batch of condensed entries."""
+    api_key = get_oauth_token()
     api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
     user_content = json.dumps(condensed, default=str)
-
-    full_prompt = instruction + user_content
-    if budget and not budget.can_afford(full_prompt):
-        allowed_chars = budget.remaining_stage() * CHARS_PER_TOKEN_ESTIMATE - len(instruction)
-        if allowed_chars < 500:
-            logger.warning("[_extract_ids_from_batch] Budget too tight, skipping")
-            return {}
-        user_content = user_content[:allowed_chars]
-        logger.info(f"[_extract_ids_from_batch] Trimmed for budget: {len(user_content)} chars")
 
     try:
         response = await litellm.acompletion(
@@ -839,8 +527,6 @@ async def _extract_ids_from_batch(
             ],
             temperature=0,
         )
-        if budget:
-            budget.record_usage(_estimate_tokens(full_prompt))
         raw = response.choices[0].message.content
         return _parse_json_from_llm(raw)
     except Exception as e:
@@ -1185,10 +871,10 @@ def extract_id_fields_for_llm(hits: list[dict]) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _make_model() -> LiteLlm:
-    return LiteLlm(
+def _make_model() -> SessionLiteLlm:
+    return SessionLiteLlm(
         model="openai/gpt-4.1",
-        api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or "pending-oauth",
+        api_key="pending-oauth",
         api_base=os.environ["AZURE_OPENAI_ENDPOINT"],
         extra_headers={"x-cisco-app": "microservice-log-analyzer"},
     )
@@ -1384,14 +1070,12 @@ class ExhaustiveSearchAgent(BaseAgent):
         all_logs: dict[str, list[dict]],
         seen_hit_ids: set[str],
         category: str,
-        rolling_summary: str,
-        budget: TokenBudget,
         id_extractor_instruction: str,
         analysis_queue: "asyncio.Queue | None" = None,
     ) -> tuple[str, dict, int]:
         """
-        Process a page of hits: deduplicate, extract IDs, summarize, update rolling summary.
-        Returns (updated_rolling_summary, extracted_ids, new_unique_count).
+        Process a page of hits: deduplicate, extract IDs.
+        Returns (extracted_ids, new_unique_count).
         """
         # Deduplicate
         new_hits = []
@@ -1414,7 +1098,7 @@ class ExhaustiveSearchAgent(BaseAgent):
 
         if not new_hits:
             logger.info(f"[_process_hits_progressive] All dupes for {category}, skipping")
-            return rolling_summary, {}, 0
+            return {}, 0
 
         condensed = extract_id_fields_for_llm(new_hits)
         logger.info(
@@ -1429,29 +1113,13 @@ class ExhaustiveSearchAgent(BaseAgent):
                 f"to analysis queue"
             )
 
-        # Run ID extraction + summarization in parallel, respecting budget
-        extracted, batch_summary = await asyncio.gather(
-            _extract_ids_from_batch(condensed, id_extractor_instruction, budget),
-            _summarize_hits(condensed, budget),
-        )
+        extracted = await _extract_ids_from_batch(condensed, id_extractor_instruction)
         logger.info(
             f"[_process_hits_progressive] LLM results: "
-            f"extracted_ids={json.dumps({k: len(v) for k, v in extracted.items() if v}, default=str)}, "
-            f"summary_len={len(batch_summary) if batch_summary else 0}"
+            f"extracted_ids={json.dumps({k: len(v) for k, v in extracted.items() if v}, default=str)}"
         )
 
-        # Append batch summary to rolling summary
-        if rolling_summary:
-            rolling_summary = f"{rolling_summary}\n\n---\n\n{batch_summary}"
-        else:
-            rolling_summary = batch_summary
-
-        # If rolling summary is getting large, compress it
-        if not budget.can_afford(rolling_summary):
-            logger.info(f"[{self.name}] Rolling summary too large, compressing...")
-            rolling_summary = await budget.compress_summary(rolling_summary)
-
-        return rolling_summary, extracted, len(new_hits)
+        return extracted, len(new_hits)
 
     # ── Helper: merge extracted IDs into accumulated set ──
     @staticmethod
@@ -1503,6 +1171,12 @@ class ExhaustiveSearchAgent(BaseAgent):
                 if id_val.startswith("NA_"):
                     skipped_dummy += 1
                     logger.debug(f"[{self.name}]   SKIP NA_ prefix: {extract_key}='{id_val}'")
+                    continue
+                # FLAG: Only follow webex-js-sdk tracking IDs for now.
+                # Update this condition to allow other prefixes later.
+                if extract_key == "tracking_ids" and not id_val.startswith("webex-js-sdk_"):
+                    skipped_dummy += 1
+                    logger.debug(f"[{self.name}]   SKIP non-sdk tracking ID: '{id_val}'")
                     continue
                 if id_val in all_seen_ids:
                     skipped_seen += 1
@@ -1561,17 +1235,14 @@ class ExhaustiveSearchAgent(BaseAgent):
         )
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 2: Initialize BFS + Token Budget + Analysis Queue
+        # Step 2: Initialize BFS
         # ══════════════════════════════════════════════════════════════════════
-        budget = TokenBudget()
         all_seen_ids: set[str] = set()
         frontier: deque[tuple[str, str, int]] = deque()
         all_logs: dict[str, list[dict]] = {"mobius": [], "sse_mse": [], "wxcas": []}
         seen_hit_ids: set[str] = set()
         search_history: list[dict] = []
         all_extracted_ids: dict = {}
-        rolling_summary: str = ""
-        chunk_summaries: list[str] = []
         max_depth_reached = 0
         TIME_PADDING_HOURS = 2
         derived_time_range: tuple[str, str] | None = None
@@ -1609,10 +1280,6 @@ class ExhaustiveSearchAgent(BaseAgent):
                 logger.info(f"[{self.name}] Reached max depth {self.max_depth}, stopping")
                 break
 
-            if budget.remaining_run() < 5000:
-                logger.warning(f"[{self.name}] Run budget nearly exhausted ({budget.remaining_run()} tokens left), stopping")
-                break
-
             # ── 3a: Collect all IDs at current depth ──
             current_batch: list[tuple[str, str]] = []
             while frontier and frontier[0][2] == current_depth:
@@ -1621,10 +1288,6 @@ class ExhaustiveSearchAgent(BaseAgent):
 
             if not current_batch:
                 continue
-
-            # Determine stage name from the dominant category
-            stage_name = f"depth_{current_depth}"
-            budget.begin_stage(stage_name)
 
             logger.info(
                 f"[{self.name}] -- Depth {current_depth}: "
@@ -1673,7 +1336,6 @@ class ExhaustiveSearchAgent(BaseAgent):
                         logger.info(f"[{self.name}]   Queued: {index} | {id_type}={id_val} -> {category}")
 
             if not search_tasks:
-                budget.end_stage()
                 continue
 
             # ── 3c: Progressive retrieval — stream pages per search task ──
@@ -1691,7 +1353,25 @@ class ExhaustiveSearchAgent(BaseAgent):
                     f"index={index}, id_val={id_val}, category={category}"
                 )
                 page_count = 0
-                async for page_hits in search_opensearch_pages(index, query):
+
+                # Prefetch pages: fetch page N+1 from OpenSearch while
+                # the LLM processes page N.  The fetch only needs the
+                # sort cursor from the previous *fetch*, not from LLM
+                # processing, so it can safely run ahead by one page.
+                prefetch_queue: asyncio.Queue[list[dict] | None] = asyncio.Queue(maxsize=1)
+
+                async def _prefetch_pages(idx: str, q: dict, out: asyncio.Queue) -> None:
+                    async for page in search_opensearch_pages(idx, q):
+                        await out.put(page)
+                    await out.put(None)
+
+                prefetch_task = asyncio.create_task(_prefetch_pages(index, query, prefetch_queue))
+
+                while True:
+                    page_hits = await prefetch_queue.get()
+                    if page_hits is None:
+                        break
+
                     page_count += 1
                     task_hits += len(page_hits)
                     logger.info(
@@ -1699,14 +1379,12 @@ class ExhaustiveSearchAgent(BaseAgent):
                         f"{len(page_hits)} hits (task cumulative: {task_hits})"
                     )
 
-                    # Process this page progressively
-                    rolling_summary, page_extracted, new_count = await self._process_hits_progressive(
+                    # Process this page while the next page is being fetched
+                    page_extracted, new_count = await self._process_hits_progressive(
                         hits=page_hits,
                         all_logs=all_logs,
                         seen_hit_ids=seen_hit_ids,
                         category=category,
-                        rolling_summary=rolling_summary,
-                        budget=budget,
                         id_extractor_instruction=self.id_extractor.instruction,
                         analysis_queue=analysis_queue,
                     )
@@ -1725,11 +1403,6 @@ class ExhaustiveSearchAgent(BaseAgent):
                         f"[{self.name}]   Cumulative extracted IDs: "
                         f"{json.dumps({k: len(v) for k, v in all_extracted_ids.items() if v}, default=str)}"
                     )
-
-                    # Check stage budget — if exhausted, stop paging this task
-                    if budget.remaining_stage() < 2000:
-                        logger.warning(f"[{self.name}] Stage budget low ({budget.remaining_stage()} remaining), stopping pagination for {index}")
-                        break
 
                 logger.info(
                     f"[{self.name}] Task {task_idx+1} complete: index={index}, "
@@ -1753,13 +1426,12 @@ class ExhaustiveSearchAgent(BaseAgent):
                 f"in {_search_elapsed:.2f}s"
             )
 
-            _log_counts = {k: len(v) for k, v in all_logs.items()}
+            all_logs_counts = {k: len(v) for k, v in all_logs.items()}
             logger.info(
                 f"[{self.name}] Depth {current_depth} search phase done: "
                 f"depth_new_hits={depth_new_hits}, derived_time_range={derived_time_range}, "
-                f"all_logs counts={_log_counts}, "
-                f"seen_hit_ids={len(seen_hit_ids)}, budget_stage={budget.remaining_stage()}, "
-                f"budget_run={budget.remaining_run()}"
+                f"all_logs counts={all_logs_counts}, "
+                f"seen_hit_ids={len(seen_hit_ids)}"
             )
 
             # ── Derive time range from first results ──
@@ -1823,12 +1495,6 @@ class ExhaustiveSearchAgent(BaseAgent):
                 f"Frontier: {len(frontier)} pending"
             )
 
-            # Save chunk summary for this depth
-            if rolling_summary:
-                chunk_summaries.append(rolling_summary)
-
-            budget.end_stage()
-
         # ══════════════════════════════════════════════════════════════════════
         # Step 3.5: Signal analysis consumer to finish and await results
         # ══════════════════════════════════════════════════════════════════════
@@ -1860,7 +1526,6 @@ class ExhaustiveSearchAgent(BaseAgent):
             default=str,
         )
 
-        budget_summary = budget.get_summary()
         ctx.session.state["search_summary"] = json.dumps(
             {
                 "total_mobius_logs": len(all_logs["mobius"]),
@@ -1869,7 +1534,6 @@ class ExhaustiveSearchAgent(BaseAgent):
                 "max_depth_reached": max_depth_reached,
                 "total_ids_searched": len(all_seen_ids),
                 "search_history": search_history,
-                "token_budget": budget_summary,
             },
             default=str,
         )
@@ -1891,9 +1555,7 @@ class ExhaustiveSearchAgent(BaseAgent):
             "all_logs": ctx.session.state["all_logs"],
             "search_summary": ctx.session.state["search_summary"],
         }
-        # Store rolling summary + chunk summaries for downstream analysis agents
-        ctx.session.state["chunk_summaries"] = json.dumps(chunk_summaries, default=str)
-        ctx.session.state["chunk_analysis_summary"] = rolling_summary
+        ctx.session.state["chunk_analysis_summary"] = analysis_rolling.get("summary", "")
 
         # Re-format analysis markdown now that search_summary is available
         if analysis_rolling:
@@ -1912,8 +1574,7 @@ class ExhaustiveSearchAgent(BaseAgent):
             f"  SSE/MSE:  {len(all_logs['sse_mse'])} logs\n"
             f"  WxCAS:    {len(all_logs['wxcas'])} logs\n"
             f"  IDs searched: {len(all_seen_ids)}\n"
-            f"  Max depth:    {max_depth_reached}\n"
-            f"  Token budget: {budget_summary['run_tokens_used']}/{budget_summary['run_budget']} used"
+            f"  Max depth:    {max_depth_reached}"
         )
         print(f"\n{'='*60}")
         print(f"  Search complete!")
@@ -1922,7 +1583,6 @@ class ExhaustiveSearchAgent(BaseAgent):
         print(f"  WxCAS:      {len(all_logs['wxcas'])} logs")
         print(f"  IDs searched: {len(all_seen_ids)}")
         print(f"  Max depth:    {max_depth_reached}")
-        print(f"  Token budget: {budget_summary['run_tokens_used']}/{budget_summary['run_budget']} used")
         print(f"  All IDs: {all_seen_ids}")
         print(f"{'='*60}")
 

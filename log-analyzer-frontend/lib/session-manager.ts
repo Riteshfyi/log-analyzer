@@ -42,7 +42,7 @@ export class SessionManager {
     if (this.sessionCreated) return
 
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 600000)
+    const timeoutId = setTimeout(() => controller.abort(), 1500000)
 
     try {
       const response = await fetch(
@@ -74,7 +74,7 @@ export class SessionManager {
 
   async sendMessage(text: string): Promise<any[]> {
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 600000)
+    const timeoutId = setTimeout(() => controller.abort(), 1500000)
 
     this.activeController = controller
     this.activeTimeout = timeoutId

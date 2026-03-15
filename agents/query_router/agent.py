@@ -8,8 +8,9 @@ from dotenv import load_dotenv
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
-from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
+
+from oauth_context import SessionLiteLlm, set_oauth_token
 
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -44,9 +45,9 @@ PIPELINE_STATE_KEYS = [
 # ── Intent parser (LlmAgent used internally, output never shown to user) ─────
 intent_parser = LlmAgent(
     name="intent_parser",
-    model=LiteLlm(
+    model=SessionLiteLlm(
         model="openai/gpt-4.1-mini",
-        api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or "pending-oauth",
+        api_key="pending-oauth",
         api_base=os.environ["AZURE_OPENAI_ENDPOINT"],
         extra_headers={"x-cisco-app": "microservice-log-analyzer"},
     ),
@@ -237,22 +238,6 @@ class QueryAnalyzerAgent(BaseAgent):
             sub_agents=[intent_parser, pipeline],
         )
 
-    @staticmethod
-    def _propagate_api_key(token: str) -> None:
-        """Update api_key on all LiteLlm model instances in the pipeline at runtime."""
-        from chat_agent.agent import chat_agent
-
-        agents_to_update = [intent_parser, chat_agent]
-        for sub in pipeline.sub_agents:
-            agents_to_update.append(sub)
-            if hasattr(sub, "sub_agents"):
-                agents_to_update.extend(sub.sub_agents)
-
-        for agent in agents_to_update:
-            model = getattr(agent, "model", None)
-            if model and hasattr(model, "_additional_args"):
-                model._additional_args["api_key"] = token
-
     # ── Fast path: structured JSON ───────────────────────────────
 
     def _parse_json_search(self, message: str) -> dict | None:
@@ -336,23 +321,14 @@ class QueryAnalyzerAgent(BaseAgent):
             ctx.session.state.setdefault(key, default)
 
         # ── Step 1: set OAuth token from session state ───────────
+        # Always reset first so a previous user's token never leaks
+        set_oauth_token("")
         oauth_token = ctx.session.state.get("oauth_token", "")
         logger.info(f"[query_router] oauth_token from session: {'yes (' + str(len(oauth_token)) + ' chars)' if oauth_token else 'EMPTY'}")
         if oauth_token:
-            os.environ["AZURE_OPENAI_API_KEY"] = oauth_token
-            os.environ["OPENAI_API_KEY"] = oauth_token
-
-            import litellm as _litellm
-            _litellm.api_key = oauth_token
-            _litellm.openai_key = oauth_token
-
-            from dotenv import load_dotenv as _reload_dotenv
-            os.environ["AZURE_OPENAI_API_KEY"] = oauth_token
-            os.environ["OPENAI_API_KEY"] = oauth_token
-
-            self._propagate_api_key(oauth_token)
-            logger.info(f"[query_router] Token propagated to env, litellm global, and all agent models")
-        elif not os.environ.get("AZURE_OPENAI_API_KEY"):
+            set_oauth_token(oauth_token)
+            logger.info(f"[query_router] Token set in contextvar for this request (per-user isolated)")
+        else:
             yield Event(
                 author=self.name,
                 content=types.Content(

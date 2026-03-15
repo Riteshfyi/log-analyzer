@@ -2,16 +2,17 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
+
+from oauth_context import SessionLiteLlm
 
 # Load environment variables from agents/.env
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
 sequence_diagram_agent = Agent(
-    model=LiteLlm(
+    model=SessionLiteLlm(
         model="openai/gpt-4.1",
-        api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or "pending-oauth",
+        api_key="pending-oauth",
         api_base=os.environ["AZURE_OPENAI_ENDPOINT"],
         extra_headers={"x-cisco-app": "microservice-log-analyzer"},
     ),

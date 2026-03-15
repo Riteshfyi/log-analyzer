@@ -18,8 +18,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from google.adk.agents import LlmAgent
-from google.adk.models.lite_llm import LiteLlm
 from google.adk.skills import load_skill_from_dir
+
+from oauth_context import SessionLiteLlm
 from google.adk.tools import skill_toolset
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -30,10 +31,10 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 
-def _make_model() -> LiteLlm:
-    return LiteLlm(
+def _make_model() -> SessionLiteLlm:
+    return SessionLiteLlm(
         model="openai/gpt-4.1",
-        api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or "pending-oauth",
+        api_key="pending-oauth",
         api_base=os.environ["AZURE_OPENAI_ENDPOINT"],
         extra_headers={"x-cisco-app": "microservice-log-analyzer"},
     )
