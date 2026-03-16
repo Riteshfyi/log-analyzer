@@ -107,8 +107,10 @@ LLM_OAUTH_SCOPE=                     # OAuth scope
 
 ```bash
 cd agents
-adk web
+adk web --allow_origins="*"
 ```
+
+The `--allow_origins="*"` flag is required to allow CORS requests from the frontend (`localhost:3000`).
 
 Expected output: ADK server starts on `http://127.0.0.1:8000`. The entry point is the `root` agent directory.
 
@@ -167,7 +169,7 @@ Open two terminals:
 cd microservice-log-analyzer
 source .venv/bin/activate
 cd agents
-adk web
+adk web --allow_origins="*"
 ```
 
 **Terminal 2 — Frontend:**
