@@ -1,5 +1,0 @@
-google-adk @ git+https://github.com/google/adk-python.git@main
-mcp>=1.0.0
-python-dotenv>=1.0.0
-uvicorn
-litellm>=1.0.0

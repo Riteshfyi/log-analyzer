@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "log-analyzer-frontend/**"
+      - "frontend/**"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
@@ -33,11 +33,11 @@ jobs:
           corepack prepare pnpm@10.12.4 --activate
 
       - name: Install dependencies
-        working-directory: log-analyzer-frontend
+        working-directory: frontend
         run: pnpm install --frozen-lockfile
 
       - name: Build static site
-        working-directory: log-analyzer-frontend
+        working-directory: frontend
         env:
           NEXT_PUBLIC_EXPORT: "true"
           NEXT_PUBLIC_BASE_PATH: "/${{ github.event.repository.name }}"
@@ -47,7 +47,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: log-analyzer-frontend/out
+          path: frontend/out
 
   deploy:
     needs: build
