@@ -1195,6 +1195,28 @@ class ExhaustiveSearchAgent(BaseAgent):
         )
         return new_ids_count, skipped_seen, skipped_dummy
 
+    def _enqueue_fallback_device_ids(
+        self,
+        extracted: dict,
+        all_seen_ids: set[str],
+        frontier: deque,
+        current_depth: int,
+    ) -> int:
+        """Enqueue device_ids as fallback when no other new IDs were found."""
+        enqueued = 0
+        for id_val in extracted.get("device_ids", []):
+            id_val = str(id_val).strip()
+            if not id_val or id_val in DUMMY_ID_VALUES or id_val.startswith("NA_"):
+                continue
+            if id_val in all_seen_ids:
+                continue
+            frontier.append((id_val, "device_id", current_depth + 1))
+            all_seen_ids.add(id_val)
+            enqueued += 1
+            logger.info(f"[{self.name}]   ENQUEUE fallback: device_id='{id_val}' -> depth {current_depth + 1}")
+            print(f"  + device_id = {id_val} -> queued for depth {current_depth + 1} (fallback)")
+        return enqueued
+
     @override
     async def _run_async_impl(
         self, ctx: InvocationContext
@@ -1483,6 +1505,19 @@ class ExhaustiveSearchAgent(BaseAgent):
             new_count, skipped_seen, skipped_dummy = self._enqueue_new_ids(
                 all_extracted_ids, all_seen_ids, frontier, current_depth,
             )
+
+            # Fallback: if no new IDs were found, try device_ids as a last resort
+            if new_count == 0:
+                fallback_count = self._enqueue_fallback_device_ids(
+                    all_extracted_ids, all_seen_ids, frontier, current_depth,
+                )
+                if fallback_count > 0:
+                    new_count += fallback_count
+                    logger.info(
+                        f"[{self.name}] Fallback: enqueued {fallback_count} device_id(s) "
+                        f"since no other new IDs were found"
+                    )
+                    print(f"  Fallback: enqueued {fallback_count} device_id(s)")
 
             logger.info(
                 f"[{self.name}] Depth {current_depth} summary: {new_count} new IDs, "
