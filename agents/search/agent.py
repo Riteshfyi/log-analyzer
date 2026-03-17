@@ -396,8 +396,8 @@ ID_TYPE_SEARCH_CONFIG = {
     "device_id": [
         {
             "service": "wxm_app",
-            "query_type": "term",
-            "field": "fields.DEVICE_ID.keyword",
+            "query_type": "match_phrase",
+            "field": "message",
             "tag_filter": "mobius",
             "category": "mobius",
         },
@@ -624,7 +624,7 @@ def build_query(
         )
     else:
         filter_clauses.append(
-            {"range": {"@timestamp": {"gte": "now-7d/d", "format": "strict_date_optional_time"}}}
+            {"range": {"@timestamp": {"gte": "now-15d/d", "format": "strict_date_optional_time"}}}
         )
         logger.debug("[build_query] Added default 7-day time range filter")
 
@@ -1174,7 +1174,7 @@ class ExhaustiveSearchAgent(BaseAgent):
                     continue
                 # FLAG: Only follow webex-js-sdk tracking IDs for now.
                 # Update this condition to allow other prefixes later.
-                if extract_key == "tracking_ids" and not id_val.startswith("webex-js-sdk_"):
+                if extract_key == "tracking_ids" and not id_val.startswith("webex-js-sdk_") and not id_val.startswith("web_worker_"):
                     skipped_dummy += 1
                     logger.debug(f"[{self.name}]   SKIP non-sdk tracking ID: '{id_val}'")
                     continue
