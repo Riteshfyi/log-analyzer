@@ -461,8 +461,10 @@ EXTRACTOR_KEY_TO_ID_TYPE = {
 # Regex for SSE Call-ID pattern in SIP message bodies
 SSE_CALLID_PATTERN = re.compile(r"SSE\d+@[\d.]+")
 
-# Pagination
+# Pagination & chunking
 PAGE_SIZE = 500
+ID_EXTRACTION_CHUNK_SIZE = 150
+ANALYSIS_BATCH_MAX = 100
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helper Functions
@@ -1107,13 +1109,20 @@ class ExhaustiveSearchAgent(BaseAgent):
         )
 
         if analysis_queue is not None:
-            await analysis_queue.put(condensed)
+            for i in range(0, len(condensed), ANALYSIS_BATCH_MAX):
+                chunk = condensed[i : i + ANALYSIS_BATCH_MAX]
+                await analysis_queue.put(chunk)
             logger.info(
                 f"[_process_hits_progressive] Pushed {len(condensed)} entries "
-                f"to analysis queue"
+                f"to analysis queue ({(len(condensed) - 1) // ANALYSIS_BATCH_MAX + 1} chunk(s))"
             )
 
-        extracted = await _extract_ids_from_batch(condensed, id_extractor_instruction)
+        extracted: dict = {}
+        for i in range(0, len(condensed), ID_EXTRACTION_CHUNK_SIZE):
+            chunk = condensed[i : i + ID_EXTRACTION_CHUNK_SIZE]
+            chunk_ids = await _extract_ids_from_batch(chunk, id_extractor_instruction)
+            for key, vals in chunk_ids.items():
+                extracted.setdefault(key, []).extend(vals)
         logger.info(
             f"[_process_hits_progressive] LLM results: "
             f"extracted_ids={json.dumps({k: len(v) for k, v in extracted.items() if v}, default=str)}"
