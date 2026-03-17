@@ -419,7 +419,6 @@ def format_to_markdown(
     summary = rolling.get("summary", "")
 
     # ── Root Cause Analysis ──
-    lines.append("---")
     lines.append("### Root Cause Analysis\n")
     if not errors:
         lines.append(
@@ -436,22 +435,21 @@ def format_to_markdown(
             fix = err.get("suggested_fix", "")
             impact = err.get("impact", "")
 
-            lines.append(f"**{i}. [{ts}]** — `{code}`\n")
+            lines.append(f"{i}. [{ts}] — `{code}`\n")
             lines.append("| Field | Detail |")
             lines.append("|-------|--------|")
-            lines.append(f"| **Service** | {svc} |")
-            lines.append(f"| **Description** | {msg} |")
+            lines.append(f"| Service | {svc} |")
+            lines.append(f"| Description | {msg} |")
             if ctx:
-                lines.append(f"| **Context** | {ctx} |")
-            lines.append(f"| **Root Cause** | {cause} |")
+                lines.append(f"| Context | {ctx} |")
+            lines.append(f"| Root Cause | {cause} |")
             if fix:
-                lines.append(f"| **Suggested Fix** | {fix} |")
+                lines.append(f"| Suggested Fix | {fix} |")
             if impact:
-                lines.append(f"| **Impact** | {impact} |")
+                lines.append(f"| Impact | {impact} |")
             lines.append("")
 
     # ── Extracted Identifiers ──
-    lines.append("---")
     lines.append("### Extracted Identifiers\n")
     label_map = {
         "tracking_ids": "Tracking ID",
@@ -468,20 +466,18 @@ def format_to_markdown(
         vals = ids.get(key, [])
         if vals:
             has_any_id = True
-            lines.append(f"- **{label}**: `{'`, `'.join(vals)}`")
+            lines.append(f"- {label}: `{'`, `'.join(vals)}`")
     if not has_any_id:
         lines.append("No identifiers extracted.")
     lines.append("")
 
     # ── Search Scope ──
     if search_summary:
-        lines.append("---")
         lines.append("### Search Scope\n")
         lines.append(search_summary)
         lines.append("")
 
     # ── Cross-Service Correlation ──
-    lines.append("---")
     lines.append("### Cross-Service Correlation\n")
     corrs = rolling.get("cross_service_correlations", [])
     if corrs:
@@ -495,7 +491,6 @@ def format_to_markdown(
     lines.append("")
 
     # ── Timing Analysis ──
-    lines.append("---")
     lines.append("### Timing Analysis\n")
     if timeline:
         first_ts = timeline[0].get("timestamp", "")
@@ -506,21 +501,20 @@ def format_to_markdown(
 
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
-        lines.append(f"| **First event** | {first_ts} |")
-        lines.append(f"| **Last event** | {last_ts} |")
-        lines.append(f"| **Total events** | {len(timeline)} |")
+        lines.append(f"| First event | {first_ts} |")
+        lines.append(f"| Last event | {last_ts} |")
+        lines.append(f"| Total events | {len(timeline)} |")
         if http_evts:
-            lines.append(f"| **HTTP requests** | {len(http_evts)} |")
+            lines.append(f"| HTTP requests | {len(http_evts)} |")
         if sip_evts:
-            lines.append(f"| **SIP messages** | {len(sip_evts)} |")
+            lines.append(f"| SIP messages | {len(sip_evts)} |")
         if error_evts:
-            lines.append(f"| **Error events** | {len(error_evts)} |")
+            lines.append(f"| Error events | {len(error_evts)} |")
     else:
         lines.append("No timeline events captured.")
     lines.append("")
 
     # ── Final Outcome ──
-    lines.append("---")
     lines.append("### Final Outcome\n")
     if summary:
         lines.append(summary)
@@ -535,29 +529,26 @@ def format_to_markdown(
         other_evts = [e for e in timeline if e.get("type") not in ("HTTP", "SIP")]
 
         if http_evts:
-            lines.append("---")
             lines.append(f"### HTTP Communication Flow ({len(http_evts)} requests)\n")
             for ev in http_evts:
                 ts = ev.get("timestamp", "?")
                 src = ev.get("source", "?")
                 dst = ev.get("destination", "?")
                 detail = ev.get("detail", "")
-                lines.append(f"- **[{ts}]** {src} \u2192 {dst}: {detail}")
+                lines.append(f"- [{ts}] {src} \u2192 {dst}: {detail}")
             lines.append("")
 
         if sip_evts:
-            lines.append("---")
             lines.append(f"### SIP Communication Flow ({len(sip_evts)} messages)\n")
             for ev in sip_evts:
                 ts = ev.get("timestamp", "?")
                 src = ev.get("source", "?")
                 dst = ev.get("destination", "?")
                 detail = ev.get("detail", "")
-                lines.append(f"- **[{ts}]** {src} \u2192 {dst}: {detail}")
+                lines.append(f"- [{ts}] {src} \u2192 {dst}: {detail}")
             lines.append("")
 
         if other_evts:
-            lines.append("---")
             lines.append(f"### Other Events ({len(other_evts)})\n")
             for ev in other_evts:
                 ts = ev.get("timestamp", "?")
@@ -565,12 +556,11 @@ def format_to_markdown(
                 src = ev.get("source", "?")
                 dst = ev.get("destination", "?")
                 detail = ev.get("detail", "")
-                lines.append(f"- **[{ts}]** `{etype}` {src} \u2192 {dst}: {detail}")
+                lines.append(f"- [{ts}] `{etype}` {src} \u2192 {dst}: {detail}")
             lines.append("")
 
     # ── Evidence References ──
     if evidence_index:
-        lines.append("---")
         lines.append(f"### Evidence Index ({len(evidence_index)} references)\n")
         display_refs = evidence_index[:25]
         lines.append("| # | Doc ID | Index | Category | Timestamp | Relevance |")
@@ -587,7 +577,6 @@ def format_to_markdown(
         lines.append("")
 
     # ── Stats ──
-    lines.append("---")
     lines.append(
         f"*Analysis: {rolling.get('batch_count', 0)} batches processed, "
         f"{len(errors)} errors found, "
