@@ -7,6 +7,12 @@ import { Input } from "@/components/ui/input"
 import { Send, Square, Bot, User, Loader2 } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 
+function cleanMarkdown(md: string): string {
+  return md
+    .replace(/^[-*]\s*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+}
+
 export interface ChatMessage {
   id: string
   role: "user" | "assistant"
@@ -23,24 +29,29 @@ interface ChatPanelProps {
 
 const markdownComponents = {
   h1: ({ children }: any) => (
-    <h1 className="text-xl font-bold text-black mb-3">{children}</h1>
+    <h1 className="text-base font-semibold text-black mb-2 mt-1">{children}</h1>
   ),
   h2: ({ children }: any) => (
-    <h2 className="text-lg font-semibold text-black mb-2 mt-4">{children}</h2>
+    <h2 className="text-sm font-semibold text-black mb-1.5 mt-3">{children}</h2>
   ),
   h3: ({ children }: any) => (
-    <h3 className="text-base font-medium text-black mb-1.5 mt-3">{children}</h3>
+    <h3 className="text-sm font-medium text-black mb-1 mt-2.5">{children}</h3>
   ),
-  p: ({ children }: any) => (
-    <p className="text-black mb-2 leading-relaxed text-sm">{children}</p>
-  ),
+  p: ({ children }: any) => {
+    if (!children || (Array.isArray(children) && children.every((c: any) => c === null || c === undefined || c === ""))) return null
+    return <p className="text-black mb-1.5 leading-relaxed text-sm">{children}</p>
+  },
   ul: ({ children }: any) => (
-    <ul className="list-disc list-inside text-black mb-2 space-y-0.5 text-sm">{children}</ul>
+    <ul className="list-disc pl-5 text-black mb-1.5 space-y-0.5 text-sm">{children}</ul>
   ),
   ol: ({ children }: any) => (
-    <ol className="list-decimal list-inside text-black mb-2 space-y-0.5 text-sm">{children}</ol>
+    <ol className="list-decimal pl-5 text-black mb-1.5 space-y-0.5 text-sm">{children}</ol>
   ),
-  li: ({ children }: any) => <li className="text-black text-sm">{children}</li>,
+  li: ({ children }: any) => {
+    if (!children || (typeof children === "string" && !children.trim())) return null
+    return <li className="text-black text-sm">{children}</li>
+  },
+  hr: () => <div className="mt-2" />,
   code: ({ children, className }: any) => {
     const isBlock = className?.includes("language-")
     if (isBlock) {
@@ -65,7 +76,7 @@ const markdownComponents = {
     </blockquote>
   ),
   strong: ({ children }: any) => (
-    <strong className="font-semibold text-black">{children}</strong>
+    <strong className="font-medium text-black">{children}</strong>
   ),
   table: ({ children }: any) => (
     <div className="overflow-x-auto mb-2">
@@ -73,7 +84,7 @@ const markdownComponents = {
     </div>
   ),
   th: ({ children }: any) => (
-    <th className="border border-gray-300 bg-gray-200 px-2 py-1 text-left font-semibold text-black">
+    <th className="border border-gray-300 bg-gray-200 px-2 py-1 text-left font-medium text-black">
       {children}
     </th>
   ),
@@ -171,9 +182,9 @@ export function ChatPanel({ messages, loading, chatDisabled, onSendMessage, onSt
                     {msg.content}
                   </p>
                 ) : (
-                  <div className="prose prose-sm max-w-none">
+                  <div className="max-w-none">
                     <ReactMarkdown components={markdownComponents}>
-                      {msg.content}
+                      {cleanMarkdown(msg.content)}
                     </ReactMarkdown>
                   </div>
                 )}

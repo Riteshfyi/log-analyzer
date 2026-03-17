@@ -16,7 +16,7 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 from pipeline.agent import root_agent as pipeline
-from analyze.agent import analyze_agent
+from analyze.incremental import analyze_upload_only
 from visualize.agent import sequence_diagram_agent
 
 logger = logging.getLogger(__name__)
@@ -79,10 +79,12 @@ CRITICAL RULES (read carefully)
       - Call ID       (UUID like "e6764ee5-2500-4ae6-8dad-81b40936ef6d")
       - Session ID    (hex string like "2ee61aa6b1d34a59bc3d2c03dcfbd807")
       - SIP Call ID   (pattern: SSE*@ip, e.g. "SSE093819274240226@150.253.214.219")
+      - Device ID     (UUID, when the user labels it as "deviceID", "device id", "device_id", etc.)
       - Correlation ID (UUID)
    b) The user's intent is to retrieve/search logs for that identifier
       (explicit words like "search", "look up", "find", "fetch", "check logs for",
-       OR simply pasting an ID with optional context like environment/region)
+       OR simply pasting an ID with optional context like environment/region,
+       OR providing a labelled identifier like "deviceID : <uuid>" or "callId <uuid>")
 
 3. A message is RE_SEARCH when ALL of these are true:
    a) The current message does NOT contain a concrete identifier
@@ -114,7 +116,13 @@ SEARCH FIELD DETECTION (for SEARCH intent only)
 Extract these from the CURRENT message only:
 
 - searchValue: the exact identifier string from the message
-- searchField: infer from the identifier pattern:
+- searchField: first check if the user EXPLICITLY labels the type, then fall back to pattern:
+    * User says "deviceID", "device id", "device_id" → "deviceId"
+    * User says "callId", "call id", "call_id" → "callId"
+    * User says "sessionId", "session id", "session_id" → "sessionId"
+    * User says "trackingId", "tracking id", "tracking_id" → "trackingId"
+    * User says "sipCallId", "sip call id" → "sipCallId"
+    If no explicit label, infer from the identifier pattern:
     * Contains "webex-js-sdk_" or "webex-web-client_" or "MOBIUS_" → "trackingId"
     * Contains "SSE" and "@" → "sipCallId"
     * 32-char hex (no dashes) → "sessionId"
@@ -204,6 +212,24 @@ Message: "analyze these logs"
 
 Message: "what do the uploaded logs show?"
 → {"intent": "upload"}
+
+Message: "deviceID : dbeaf088-f610-3ff4-8664-abb2097b633f"
+→ {"intent": "search", "searchValue": "dbeaf088-f610-3ff4-8664-abb2097b633f", "searchField": "deviceId", "environment": null, "region": null}
+(User explicitly labels the identifier type as deviceID.)
+
+Message: "deviceID dbeaf088-f610-3ff4-8664-abb2097b633f"
+→ {"intent": "search", "searchValue": "dbeaf088-f610-3ff4-8664-abb2097b633f", "searchField": "deviceId", "environment": null, "region": null}
+(Same — label without colon is still a labelled identifier.)
+
+Message: "device id dbeaf088-f610-3ff4-8664-abb2097b633f in prod"
+→ {"intent": "search", "searchValue": "dbeaf088-f610-3ff4-8664-abb2097b633f", "searchField": "deviceId", "environment": "prod", "region": null}
+
+Message: "callId e6764ee5-2500-4ae6-8dad-81b40936ef6d"
+→ {"intent": "search", "searchValue": "e6764ee5-2500-4ae6-8dad-81b40936ef6d", "searchField": "callId", "environment": null, "region": null}
+(User explicitly labels the type even though UUID pattern would also match callId.)
+
+Message: "sessionId 2ee61aa6b1d34a59bc3d2c03dcfbd807"
+→ {"intent": "search", "searchValue": "2ee61aa6b1d34a59bc3d2c03dcfbd807", "searchField": "sessionId", "environment": null, "region": null}
 
 Message: "search for the same thing"
 → {"intent": "chat"}
@@ -389,12 +415,13 @@ class QueryAnalyzerAgent(BaseAgent):
             # referencing {sdk_logs} don't raise KeyError when no file is uploaded.
             ctx.session.state["sdk_logs"] = ""
 
-            # Store SDK logs if uploaded
             if upload_only:
-                ctx.session.state["sdk_logs"] = search_params.get("sdk_logs", "")
-                logger.info("[router] Upload-only mode — skipping search, running analyze + visualize")
-                async for event in analyze_agent.run_async(ctx):
-                    yield event
+                sdk_logs = search_params.get("sdk_logs", "")
+                ctx.session.state["sdk_logs"] = sdk_logs
+                logger.info("[router] Upload-only mode — running incremental analysis + visualize")
+                markdown, _rolling, _evidence = await analyze_upload_only(sdk_logs)
+                ctx.session.state["analyze_results"] = markdown
+                ctx.session.state["analysis_evidence"] = json.dumps(_evidence, default=str)
                 async for event in sequence_diagram_agent.run_async(ctx):
                     yield event
             else:

@@ -1,11 +1,12 @@
 """
-Exhaustive Search Agent — BFS-based log search with ID extraction.
+Exhaustive Search Agent v2 — Dynamic BFS-based log search with parallel execution.
 
-1. Given any ID, searches relevant OpenSearch indexes directly
-2. Extracts all discoverable IDs from results via LLM
+Replaces the static sequential pipeline with a custom BaseAgent that:
+1. Given any ID, searches relevant OpenSearch indexes directly (no MCP subprocess)
+2. Extracts ALL discoverable IDs from results via a single LLM extractor
 3. Repeats with newly found IDs (BFS graph traversal)
 4. Parallelizes independent searches via asyncio.gather
-5. Falls back to device_id search when no other new IDs are found
+5. If a session ID is the entry point, searches both Mobius AND wxcalling in parallel
 """
 
 import os
@@ -18,6 +19,8 @@ import threading
 import time
 import requests
 from collections import deque
+
+_log_cache: dict[str, dict[str, str]] = {}
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 from typing_extensions import override
@@ -28,6 +31,13 @@ from google.genai import types as genai_types
 from google.adk.agents import LlmAgent, BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
+from google.adk.models.lite_llm import LiteLlm
+
+from analyze.incremental import (
+    run_analysis_consumer,
+    format_to_markdown,
+    SENTINEL,
+)
 from opensearchpy import OpenSearch, RequestsHttpConnection
 
 from oauth_context import SessionLiteLlm, get_oauth_token
@@ -1061,7 +1071,8 @@ class ExhaustiveSearchAgent(BaseAgent):
         seen_hit_ids: set[str],
         category: str,
         id_extractor_instruction: str,
-    ) -> tuple[dict, int]:
+        analysis_queue: "asyncio.Queue | None" = None,
+    ) -> tuple[str, dict, int]:
         """
         Process a page of hits: deduplicate, extract IDs.
         Returns (extracted_ids, new_unique_count).
@@ -1094,6 +1105,13 @@ class ExhaustiveSearchAgent(BaseAgent):
             f"[_process_hits_progressive] Condensed {len(new_hits)} hits -> "
             f"{len(condensed)} entries for LLM"
         )
+
+        if analysis_queue is not None:
+            await analysis_queue.put(condensed)
+            logger.info(
+                f"[_process_hits_progressive] Pushed {len(condensed)} entries "
+                f"to analysis queue"
+            )
 
         extracted = await _extract_ids_from_batch(condensed, id_extractor_instruction)
         logger.info(
@@ -1251,6 +1269,15 @@ class ExhaustiveSearchAgent(BaseAgent):
         TIME_PADDING_HOURS = 2
         derived_time_range: tuple[str, str] | None = None
 
+        analysis_queue: asyncio.Queue = asyncio.Queue()
+        analysis_task = asyncio.create_task(
+            run_analysis_consumer(
+                queue=analysis_queue,
+                sdk_logs=ctx.session.state.get("sdk_logs", ""),
+            )
+        )
+        logger.info(f"[{self.name}] Analysis consumer task started in background")
+
         for ident in identifiers:
             id_val = ident["value"]
             id_type = ident.get("type", "unknown")
@@ -1381,6 +1408,7 @@ class ExhaustiveSearchAgent(BaseAgent):
                         seen_hit_ids=seen_hit_ids,
                         category=category,
                         id_extractor_instruction=self.id_extractor.instruction,
+                        analysis_queue=analysis_queue,
                     )
                     depth_new_hits += new_count
 
@@ -1503,6 +1531,24 @@ class ExhaustiveSearchAgent(BaseAgent):
             )
 
         # ══════════════════════════════════════════════════════════════════════
+        # Step 3.5: Signal analysis consumer to finish and await results
+        # ══════════════════════════════════════════════════════════════════════
+        await analysis_queue.put(SENTINEL)
+        logger.info(f"[{self.name}] Sent sentinel to analysis consumer, awaiting results...")
+        try:
+            analysis_markdown, analysis_rolling, analysis_evidence = await analysis_task
+            logger.info(
+                f"[{self.name}] Analysis consumer finished: "
+                f"{analysis_rolling.get('batch_count', 0)} batches, "
+                f"{len(analysis_evidence)} evidence refs"
+            )
+        except Exception as e:
+            logger.error(f"[{self.name}] Analysis consumer failed: {e}")
+            analysis_markdown = ""
+            analysis_rolling = {}
+            analysis_evidence = []
+
+        # ══════════════════════════════════════════════════════════════════════
         # Step 4: Store final results in session state
         # ══════════════════════════════════════════════════════════════════════
         logger.info(f"[{self.name}] Step 4: Storing final results in session state")
@@ -1537,6 +1583,26 @@ class ExhaustiveSearchAgent(BaseAgent):
             [hit.get("_source", {}) for hit in all_logs["wxcas"]], default=str
         )
 
+        _log_cache[ctx.session.id] = {
+            "mobius_logs": ctx.session.state["mobius_logs"],
+            "sse_mse_logs": ctx.session.state["sse_mse_logs"],
+            "wxcas_logs": ctx.session.state["wxcas_logs"],
+            "all_logs": ctx.session.state["all_logs"],
+            "search_summary": ctx.session.state["search_summary"],
+        }
+        ctx.session.state["chunk_analysis_summary"] = analysis_rolling.get("summary", "")
+
+        # Re-format analysis markdown now that search_summary is available
+        if analysis_rolling:
+            analysis_markdown = format_to_markdown(
+                analysis_rolling,
+                analysis_evidence,
+                search_summary=ctx.session.state.get("search_summary", ""),
+            )
+        ctx.session.state["analyze_results"] = analysis_markdown
+        ctx.session.state["analysis_evidence"] = json.dumps(analysis_evidence, default=str)
+        _log_cache[ctx.session.id]["analyze_results"] = analysis_markdown
+
         logger.info(
             f"[{self.name}] == Search complete ==\n"
             f"  Mobius:    {len(all_logs['mobius'])} logs\n"
@@ -1561,11 +1627,12 @@ class ExhaustiveSearchAgent(BaseAgent):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 search_agent = ExhaustiveSearchAgent(
-    name="search_agent",
+    name="search_agent_v2",
     query_parser=query_parser,
     id_extractor=id_extractor,
     max_depth=3,
 )
 
-# When running standalone (`adk web agents/search`), expose as root_agent.
+# When running standalone (`adk web agents/search_agent_v2`), expose as root_agent.
+# When imported by root_agent_v2, this is ignored (root_agent_v2 defines its own).
 root_agent = search_agent

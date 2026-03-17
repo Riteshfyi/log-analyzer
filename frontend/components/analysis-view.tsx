@@ -15,16 +15,24 @@ export function AnalysisView({ analysis }: AnalysisViewProps) {
 
   return (
 
-        <div className="prose prose-sm max-w-none text-black h-full p-4">
+        <div className="max-w-none text-black h-full p-4">
           <ReactMarkdown
             components={{
-              h1: ({ children }) => <h1 className="text-2xl font-bold text-black mb-4">{children}</h1>,
-              h2: ({ children }) => <h2 className="text-xl font-semibold text-black mb-3 mt-6">{children}</h2>,
-              h3: ({ children }) => <h3 className="text-lg font-medium text-black mb-2 mt-4">{children}</h3>,
-              p: ({ children }) => <p className="text-black mb-3 leading-relaxed">{children}</p>,
-              ul: ({ children }) => <ul className="list-disc list-inside text-black mb-3 space-y-1">{children}</ul>,
-              ol: ({ children }) => <ol className="list-decimal list-inside text-black mb-3 space-y-1">{children}</ol>,
-              li: ({ children }) => <li className="text-black">{children}</li>,
+              h1: ({ children }) => <h1 className="text-lg font-semibold text-black mb-3">{children}</h1>,
+              h2: ({ children }) => <h2 className="text-base font-semibold text-black mb-2 mt-5">{children}</h2>,
+              h3: ({ children }) => <h3 className="text-sm font-medium text-black mb-1.5 mt-3">{children}</h3>,
+              p: ({ children }) => {
+                if (!children || (Array.isArray(children) && children.every((c: any) => c === null || c === undefined || c === ""))) return null
+                return <p className="text-black mb-2 leading-relaxed text-sm">{children}</p>
+              },
+              ul: ({ children }) => <ul className="list-disc pl-5 text-black mb-2 space-y-0.5 text-sm">{children}</ul>,
+              ol: ({ children }) => <ol className="list-decimal pl-5 text-black mb-2 space-y-0.5 text-sm">{children}</ol>,
+              li: ({ children }) => {
+                if (!children || (typeof children === "string" && !(children as string).trim())) return null
+                return <li className="text-black text-sm">{children}</li>
+              },
+              hr: () => <div className="mt-2" />,
+              strong: ({ children }) => <strong className="font-medium text-black">{children}</strong>,
               code: ({ children }) => (
                 <code className="bg-gray-100 px-1 py-0.5 rounded text-black font-mono text-sm">{children}</code>
               ),
@@ -40,7 +48,7 @@ export function AnalysisView({ analysis }: AnalysisViewProps) {
               ),
             }}
           >
-            {analysis}
+            {analysis.replace(/^[-*]\s*$/gm, "").replace(/\n{3,}/g, "\n\n")}
           </ReactMarkdown>
         </div>
 

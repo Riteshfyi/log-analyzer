@@ -1,7 +1,16 @@
 """
-Analyze Agent — Routes to calling_agent or contact_center_agent based on serviceIndicator.
+Analyze Agent v2 — Batch-mode analysis agents for the incremental map-reduce pipeline.
 
-Consumes state keys from search agent: mobius_logs, sse_mse_logs, wxcas_logs, search_summary.
+Invoked programmatically via ADK Runner from incremental.py's run_analysis_consumer().
+Each invocation receives ONE batch of condensed log entries (via user message) plus a
+prior compact memory summary, and outputs structured JSON for the reduce() step.
+
+Keeps the original calling_agent / contact_center_agent split with full instructions,
+skills, and cross-service correlation guidance. Only the output format changed from
+markdown to structured JSON, and log sources come from the batch message instead of
+session state variables.
+
+Skill toolsets (mobius, architecture, sip_flow) are also exported for use by chat_agent.
 """
 
 import os
@@ -36,23 +45,22 @@ def _make_model() -> SessionLiteLlm:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SEARCH_CONTEXT_PREAMBLE = """
-**Search Context (from exhaustive BFS search):**
-The logs below were collected by an exhaustive graph-traversal search agent that:
+**Batch Analysis Context (from exhaustive BFS search):**
+You will receive ONE BATCH of condensed log entries from a Webex Calling / Contact Center \
+platform, along with a PRIOR ANALYSIS SUMMARY from earlier batches (compact memory).
+
+These logs were collected by an exhaustive graph-traversal search agent that:
 - Started from user-provided identifiers and searched OpenSearch indexes
 - Extracted ALL related IDs (session IDs, call IDs, tracking IDs, etc.)
 - Recursively searched for those IDs across multiple indexes and services
 - Ran searches in parallel for speed
 
-Search summary: {search_summary}
-
-This means you may have logs spanning MULTIPLE call legs, forwarded sessions,
+This means the batch may contain logs spanning MULTIPLE call legs, forwarded sessions,
 retries, or related interactions that a single-ID search would have missed.
-Use the search_summary to understand the scope: how many IDs were searched,
-what depth the BFS reached, and what indexes were queried.
 
-**IMPORTANT: You must analyze EVERY log entry. Do NOT skip or summarize groups of logs.
-Read each log line, extract its meaning, and incorporate it into the analysis.
-If there are hundreds of logs, produce a correspondingly detailed analysis.**
+**IMPORTANT: You must analyze EVERY log entry in this batch. Do NOT skip or summarize \
+groups of logs. Read each log line, extract its meaning, and incorporate it into the analysis.
+If there is a prior analysis summary, build upon it — focus on what is NEW in this batch.**
 """
 
 _ANALYSIS_POINTS = """
@@ -109,103 +117,70 @@ Your analysis MUST cover ALL of the following in full detail:
     - Track the same transaction across service boundaries
 """
 
-_OUTPUT_STRUCTURE = """
-**Output Detail Level:** {detailed_analysis}
-If detailed_analysis is false, empty, or not set:
-- COMPLETELY OMIT the "HTTP Communication Flow (Detailed)" section — do not print its header, do not print a placeholder, do not mention it at all
-- COMPLETELY OMIT the "SIP Communication Flow (Detailed)" section — do not print its header, do not print a placeholder, do not mention it at all
-- Your output must end after the "Final Outcome" section. Nothing after it.
+_JSON_OUTPUT_SCHEMA = """\
+## Output Format
 
-If detailed_analysis is true:
-- Include ALL sections below, including the detailed HTTP and SIP Communication Flow
+Output ONLY valid JSON — no markdown fences, no preamble, no explanation outside the JSON.
+Your analysis from the sections above must be captured in the structured fields below.
 
-**Output structure (follow this EXACTLY):**
+{
+  "new_identifiers": {
+    "session_ids": ["<localSessionId or remoteSessionId values>"],
+    "call_ids": ["<mobiusCallId values>"],
+    "sip_call_ids": ["<SIP Call-ID headers (UUID format)>"],
+    "sse_call_ids": ["<SSE Call-ID patterns like SSE0520...@IP>"],
+    "tracking_ids": ["<WEBEX_TRACKINGID values>"],
+    "user_ids": ["<USER_ID values>"],
+    "device_ids": ["<DEVICE_ID values>"],
+    "trace_ids": ["<trace/span IDs>"]
+  },
+  "events": [
+    {
+      "timestamp": "<ISO timestamp>",
+      "type": "HTTP|SIP|media|routing|registration|websocket|error",
+      "source": "<originating service: Mobius|SSE|MSE|WxCAS|Browser|CPAPI|Mercury>",
+      "destination": "<target service or endpoint>",
+      "detail": "<method, path, status code, SIP method/response, Call-ID, CSeq, SDP summary, or description>"
+    }
+  ],
+  "errors": [
+    {
+      "timestamp": "<ISO timestamp>",
+      "code": "<HTTP status, SIP response code, mobius-error code>",
+      "service": "<Mobius|SSE|MSE|WxCAS|CPAPI>",
+      "message": "<error message text>",
+      "suspected_cause": "<root cause hypothesis — use skill tools for specifics>",
+      "context": "<what was happening when the error occurred>",
+      "suggested_fix": "<actionable remediation steps>",
+      "impact": "<how did this error affect the call/session>"
+    }
+  ],
+  "state_updates": [
+    {
+      "timestamp": "<ISO timestamp>",
+      "transition": "<what changed>",
+      "from_state": "<previous state>",
+      "to_state": "<new state>"
+    }
+  ],
+  "evidence_refs": [
+    {
+      "doc_id": "<OpenSearch _id if available>",
+      "index": "<index name if available>",
+      "timestamp": "<log timestamp>",
+      "category": "mobius|sse_mse|wxcas",
+      "relevance": "<why this entry matters for debugging>"
+    }
+  ],
+  "delta_summary": "<2-4 sentence summary of what THIS batch reveals that is NEW compared to the prior summary. Include: call type if identifiable, key milestones, errors found, cross-service correlations, timing anomalies.>"
+}
 
----
-### ❗ Root Cause Analysis
-(Place this section at the VERY TOP of your analysis—first section. If no errors/issues were found, state "No errors or issues detected" and briefly confirm the flow succeeded.)
+**Capture EVERY HTTP request/response and EVERY SIP message as individual events.**
+Do NOT skip any. If there are 50 HTTP requests, produce 50 event entries.
+If there are 20 SIP messages, produce 20 event entries.
+Include SDP summaries (codec, media type, ICE candidates count) in SIP event details when available.
 
-For EACH issue found:
-→ **[Timestamp]**: ErrorType (ErrorCode)
-→ **Service**: Which service generated the error
-→ **Context**: What was happening when this error occurred
-→ **Description**: Detailed explanation of what went wrong
-→ **Potential Root Causes**: List all possible causes, ranked by likelihood
-→ **Suggested Fix**: Clear, actionable steps to resolve
-→ **Impact**: How did this error affect the call/session?
-→ **Notes**: Documentation references, escalation contacts, related issues
-
----
-### 🔍 Extracted Identifiers
-List ALL unique identifiers found across all log sources:
-- **User ID**:
-- **Device ID**:
-- **Tracking ID**: (print baseTrackingID_* to represent multiple suffixes. Don't print all suffixes)
-- **Call ID** (Mobius):
-- **Call ID** (SSE/SIP):
-- **Session ID (local)**:
-- **Session ID (remote)**:
-- **Meeting ID** (if any):
-- **Trace ID** (if any):
-
----
-### 📊 Search Scope
-- **IDs searched**: (from search_summary.total_ids_searched)
-- **Indexes queried**: (list unique indexes from search_summary.search_history)
-- **Total logs analyzed**: Mobius: X, SSE/MSE: Y, WxCAS: Z
-
----
-### 🔗 Cross-Service Correlation
-Map how the same transaction flows across services:
-- Tracking ID X in Mobius → corresponds to Call-ID Y in SSE → routed via WxCAS as Z
-- Note any missing correlations or gaps in the flow
-
----
-### ⏱️ Timing Analysis
-- **Call setup time**: (INVITE to 200 OK)
-- **Total duration**: (first log to last log, or INVITE to BYE)
-- **Notable delays**: List any gaps > 2 seconds between expected sequential events
-- **Retries/Retransmissions**: Count and note if any
-
----
-### ✅ Final Outcome
-Provide a comprehensive summary of the entire flow:
-- What type of call was this? (WebRTC-to-WebRTC, WebRTC-to-PSTN, etc.)
-- Did the call succeed or fail?
-- Complete signaling path taken
-- Media path established (or not)
-- Any degradation or issues even if the call succeeded
-
----
-### 📡 HTTP Communication Flow (Detailed)
-Place this section at the BOTTOM of your analysis, after Root Cause Analysis and all summaries.
-List ALL HTTP requests and responses in strict chronological order.
-Each entry should be ONE concise line with the format:
-
-→ **[Timestamp]** Source → Destination: METHOD /path - StatusCode (Brief description)
-
-Example:
-→ **[2026-02-13T10:00:00Z]** Client → Mobius: POST /v1/calling/web/devices/.../call - 200 OK (Call initiation)
-→ **[2026-02-13T10:00:01Z]** Mobius → CPAPI: GET /features - 200 OK (Feature retrieval)
-
-**Do NOT skip any HTTP interactions.** If there are 50 requests, list all 50.
-
----
-### 📞 SIP Communication Flow (Detailed)
-List ALL SIP messages in strict chronological order, after the HTTP Communication Flow.
-Keep Mobius, SSE, MSE, and WxCAS as separate participants.
-
-→ **[Timestamp]** Source → Destination: SIP Method/Response - Call-ID: xxx - Description
-→ **[Timestamp]** Mobius → SSE: SIP INVITE - Call-ID: SSE0520... - Initial call setup
-→ **[Timestamp]** SSE → Mobius: 100 Trying - Call-ID: SSE0520... - Call being processed
-→ **[Timestamp]** SSE → WxCAS: INVITE - Call-ID: SSE0520... - Routing to app server
-→ **[Timestamp]** WxCAS → SSE: 200 OK - Call-ID: SSE0520... - Call accepted
-→ **[Timestamp]** SSE → Mobius: 200 OK - Call-ID: SSE0520... - Final response
-
-Include SDP summary when available (codec, media type, ICE candidates count).
-**Do NOT skip any SIP messages.** Reconstruct the COMPLETE dialog.
-
----
+If no items exist for a category, use an empty list [].
 """
 
 
@@ -236,7 +211,6 @@ sip_flow_skill_toolset = skill_toolset.SkillToolset(skills=[sip_flow_skill])
 calling_agent = LlmAgent(
     model=_make_model(),
     name="calling_agent",
-    output_key="analyze_results",
     tools=[mobius_skill_toolset, architecture_skill_toolset, sip_flow_skill_toolset],
     instruction=f"""You are a senior VoIP/WebRTC debugging expert with deep expertise in HTTP, WebRTC, SIP, SDP, RTP, SRTP, DTLS, ICE, TCP, UDP, TLS, and related protocols. You produce EXHAUSTIVE, production-grade debug analyses that leave no log entry unexamined.
 
@@ -244,12 +218,13 @@ calling_agent = LlmAgent(
 
 Use the **architecture_endpoints_skill** for service roles, signaling/media paths, and WebRTC Calling architecture (see references/architecture_and_endpoints.md — endpoints and WebRTC Calling sections).
 Use the **sip_flow_skill** for SIP message sequences, response code meanings, SDP negotiation details, SIP timers, and common failure patterns (see references/sip_flows.md).
+Use the **mobius_error_id_skill** when you encounter mobius-error codes or unexpected HTTP status codes from Mobius.
 
-**Log Sources — Analyze ALL of them thoroughly:**
-1. **Mobius logs** from {{{{mobius_logs}}}} (logstash-wxm-app indexes) — HTTP/WebSocket signaling, SIP translation, device registration
-2. **SSE/MSE logs** from {{{{sse_mse_logs}}}} (logstash-wxcalling indexes) — SIP edge signaling, media relay
-3. **WxCAS logs** from {{{{wxcas_logs}}}} (logstash-wxcalling indexes) — Call routing, destination resolution, application server logic
-4. **SDK/Client logs** from {{{{sdk_logs}}}} (uploaded by user) — Client-side SDK perspective (browser/app WebRTC logs)
+**Log Sources in this batch — recognize them by their tags/index patterns:**
+1. **Mobius logs** (logstash-wxm-app indexes, tags: mobius) — HTTP/WebSocket signaling, SIP translation, device registration
+2. **SSE/MSE logs** (logstash-wxcalling indexes, tags: sse, mse) — SIP edge signaling, media relay
+3. **WxCAS logs** (logstash-wxcalling indexes, tags: wxcas) — Call routing, destination resolution, application server logic
+4. **SDK/Client logs** (uploaded by user) — Client-side SDK perspective (browser/app WebRTC logs)
 
 When SDK/Client logs are present, these provide the browser/app perspective. Correlate with server-side logs when both are available.
 
@@ -269,7 +244,7 @@ then show how they connect.
 
 {_ANALYSIS_POINTS}
 
-{_OUTPUT_STRUCTURE}
+{_JSON_OUTPUT_SCHEMA}
 """,
 )
 
@@ -281,7 +256,6 @@ then show how they connect.
 contact_center_agent = LlmAgent(
     model=_make_model(),
     name="contact_center_agent",
-    output_key="analyze_results",
     tools=[architecture_skill_toolset, sip_flow_skill_toolset],
     instruction=f"""You are a senior VoIP/Contact Center debugging expert with deep expertise in HTTP, WebRTC, SIP, SDP, RTP, SRTP, DTLS, ICE, TCP, UDP, TLS, and related protocols. You produce EXHAUSTIVE, production-grade debug analyses that leave no log entry unexamined.
 
@@ -290,17 +264,20 @@ contact_center_agent = LlmAgent(
 Use the **architecture_endpoints_skill** for service roles and Contact Center architecture (see references/architecture_and_endpoints.md — endpoints and Contact Center sections).
 Use the **sip_flow_skill** for SIP message sequences, response code meanings, SDP negotiation details, SIP timers, and common failure patterns (see references/sip_flows.md).
 
-**Log Sources — Analyze ALL of them thoroughly:**
-1. **Mobius logs** from {{{{mobius_logs}}}} (logstash-wxm-app indexes) — HTTP/WebSocket signaling, SIP translation
-2. **SSE/MSE logs** from {{{{sse_mse_logs}}}} (logstash-wxcalling indexes) — SIP edge signaling, media relay
-3. **WxCAS logs** from {{{{wxcas_logs}}}} (logstash-wxcalling indexes) — Call routing logic
-4. **SDK/Client logs** from {{{{sdk_logs}}}} (uploaded by user) — Client-side SDK perspective
+**Log Sources in this batch — recognize them by their tags/index patterns:**
+1. **Mobius logs** (logstash-wxm-app indexes, tags: mobius) — HTTP/WebSocket signaling, SIP translation
+2. **SSE/MSE logs** (logstash-wxcalling indexes, tags: sse, mse) — SIP edge signaling, media relay
+3. **WxCAS logs** (logstash-wxcalling indexes, tags: wxcas) — Call routing logic
+4. **SDK/Client logs** (uploaded by user) — Client-side SDK perspective
 
 When SDK/Client logs are present, these provide the browser/app perspective. Correlate with server-side logs when both are available.
 
 **Cross-source correlation is CRITICAL:**
 - The SAME call appears in multiple log sources with different perspectives
 - Correlate using shared IDs: Call-ID, Session ID, Tracking ID
+- Mobius logs show the browser↔server HTTP side
+- SSE logs show the SIP signaling side of the same events
+- WxCAS logs show routing decisions
 - Present a UNIFIED view that stitches together all perspectives
 
 Because the search was exhaustive (BFS), you may see logs from MULTIPLE call legs,
@@ -308,7 +285,7 @@ forwarded sessions, or related interactions. Identify and correlate ALL of them.
 
 {_ANALYSIS_POINTS}
 
-{_OUTPUT_STRUCTURE}
+{_JSON_OUTPUT_SCHEMA}
 """,
 )
 
@@ -317,35 +294,21 @@ forwarded sessions, or related interactions. Identify and correlate ALL of them.
 # Coordinator: Routes to calling or contact center based on serviceIndicator
 # ═══════════════════════════════════════════════════════════════════════════════
 
-
-def _ensure_state_defaults(callback_context) -> None:
-    """Guarantee optional state keys exist so {var} references don't KeyError."""
-    callback_context.state.setdefault("sdk_logs", "")
-
-
-analyze_agent = LlmAgent(
-    name="analyze_agent",
-    output_key="analyze_results",
+batch_analysis_agent = LlmAgent(
+    name="batch_analysis_agent",
     model=_make_model(),
-    before_agent_callback=_ensure_state_defaults,
     instruction="""
-Context: You are analyzing logs from a WebRTC Calling or contact center flow,
-which involves talking to different endpoints using protocols like HTTP, SIP,
-WebRTC, SDP, RTP, TLS.
+You are a log analysis router. You will receive a batch of condensed log entries
+from a Webex Calling / Contact Center platform.
 
-You have access to the full search results from an exhaustive BFS search:
-- Search summary: {search_summary}
-- Mobius logs: {mobius_logs}
-- SSE/MSE logs: {sse_mse_logs}
-- WxCAS logs: {wxcas_logs}
-- SDK/Client logs: {sdk_logs}
-
-Use `serviceIndicator` from logs to classify the session:
+Look at the log entries for `serviceIndicator` fields to classify the session:
 - `calling`, `guestCalling` → WebRTC Calling Flow, transfer to `calling_agent`
 - `contactCenter` → Contact Center Flow, transfer to `contact_center_agent`
 
 If no `serviceIndicator` is found, default to `calling_agent`.
+
+Transfer the FULL user message (batch data) to the selected agent.
 """,
-    description="Routes analysis to Calling or ContactCenter agent based on serviceIndicator in logs.",
+    description="Routes batch analysis to Calling or ContactCenter agent based on serviceIndicator in logs.",
     sub_agents=[calling_agent, contact_center_agent],
 )
