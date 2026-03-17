@@ -31,6 +31,8 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
+from oauth_context import get_oauth_token
+
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
@@ -97,12 +99,12 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _get_llm_config() -> tuple[str, str]:
-    """Return (api_key, api_base) for LLM calls."""
-    api_key = (
-        os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("AZURE_OPENAI_API_KEY")
-        or "pending-oauth"
-    )
+    """Return (api_key, api_base) for LLM calls.
+
+    Prefers the per-request OAuth token from the contextvar (set by the
+    router at request start) over stale env-var values.
+    """
+    api_key = get_oauth_token() or os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or "pending-oauth"
     api_base = os.environ["AZURE_OPENAI_ENDPOINT"]
     return api_key, api_base
 
@@ -150,18 +152,18 @@ _MAP_USER_TEMPLATE = """\
 async def map_batch(
     condensed_hits: list[dict],
     compact_memory: str,
-    session_id: str,
+    session_id: str = "",
 ) -> dict:
     """MAP step: analyze one batch of log entries via ADK Runner.
 
-    Sends the batch + compact_memory as a user message to the shared session
-    and collects the structured JSON response from the batch_analysis_agent
-    (which routes to calling_agent or contact_center_agent with full skills).
+    Creates a fresh session per batch to avoid context bloat — the
+    compact_memory already carries forward essential context from prior
+    batches, so session history is redundant.
 
     Args:
         condensed_hits: list of condensed log entries (from extract_id_fields_for_llm)
         compact_memory: the rolling_analysis["summary"] from prior batches (few KB)
-        session_id: the shared session ID for this analysis run
+        session_id: ignored (kept for API compat); a fresh session is created per call
 
     Returns:
         MapOutput dict matching the JSON schema, or empty dict on failure.
@@ -173,7 +175,14 @@ async def map_batch(
         batch_json=batch_json,
     )
 
+    batch_session_id = f"batch-{uuid.uuid4().hex[:12]}"
     try:
+        await _session_service.create_session(
+            app_name=_APP_NAME,
+            user_id=_USER_ID,
+            session_id=batch_session_id,
+        )
+
         user_message = types.Content(
             role="user",
             parts=[types.Part.from_text(text=user_content)],
@@ -182,7 +191,7 @@ async def map_batch(
         final_text = ""
         async for event in _runner.run_async(
             user_id=_USER_ID,
-            session_id=session_id,
+            session_id=batch_session_id,
             new_message=user_message,
         ):
             if event.content and event.content.parts:
@@ -204,6 +213,15 @@ async def map_batch(
     except Exception as e:
         logger.error(f"[map_batch] ADK Runner call failed: {e}")
         return {}
+    finally:
+        try:
+            await _session_service.delete_session(
+                app_name=_APP_NAME,
+                user_id=_USER_ID,
+                session_id=batch_session_id,
+            )
+        except Exception:
+            pass
 
 
 
@@ -610,8 +628,8 @@ async def run_analysis_consumer(
     chunks them and processes those batches too — building a unified
     rolling_analysis covering both data sources.
 
-    A single temporary ADK session is created for the entire analysis run and
-    destroyed when the consumer finishes (or on error).
+    Each batch gets a fresh ADK session (created/destroyed inside map_batch)
+    to avoid context bloat. The compact_memory carries forward essential context.
 
     Args:
         queue: asyncio.Queue fed by the search producer; items are
@@ -625,77 +643,59 @@ async def run_analysis_consumer(
     rolling = new_rolling_analysis()
     evidence_index: list[dict] = []
 
-    session_id = f"analysis-run-{uuid.uuid4().hex[:12]}"
-    await _session_service.create_session(
-        app_name=_APP_NAME,
-        user_id=_USER_ID,
-        session_id=session_id,
-    )
-    logger.info(f"[analysis_consumer] Created shared session {session_id}")
+    logger.info("[analysis_consumer] Started (fresh session per batch mode)")
 
-    try:
-        batch_num = 0
+    batch_num = 0
 
-        # Phase 1: consume search batches from the queue
-        while True:
-            item = await queue.get()
-            if item is SENTINEL:
-                queue.task_done()
-                logger.info("[analysis_consumer] Received sentinel, search batches done")
-                break
+    # Phase 1: consume search batches from the queue
+    while True:
+        item = await queue.get()
+        if item is SENTINEL:
+            queue.task_done()
+            logger.info("[analysis_consumer] Received sentinel, search batches done")
+            break
 
+        batch_num += 1
+        condensed_hits = item
+        logger.info(
+            f"[analysis_consumer] Processing search batch {batch_num} "
+            f"({len(condensed_hits)} entries)"
+        )
+
+        compact_memory = rolling["summary"]
+
+        map_output = await map_batch(condensed_hits, compact_memory)
+        if map_output:
+            rolling, evidence_index = reduce(rolling, map_output, evidence_index)
+
+        summary_tokens = _estimate_tokens(rolling.get("summary", ""))
+        if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
+            rolling = await compress_analysis_summary(rolling)
+
+        queue.task_done()
+
+    # Phase 2: chunk and process SDK logs (if provided)
+    sdk_batches = chunk_sdk_logs(sdk_logs)
+    if sdk_batches:
+        logger.info(
+            f"[analysis_consumer] Processing {len(sdk_batches)} SDK log batches "
+            f"({sum(len(b) for b in sdk_batches)} lines)"
+        )
+        for condensed in sdk_batches:
             batch_num += 1
-            condensed_hits = item
             logger.info(
-                f"[analysis_consumer] Processing search batch {batch_num} "
-                f"({len(condensed_hits)} entries)"
+                f"[analysis_consumer] Processing SDK batch {batch_num} "
+                f"({len(condensed)} entries)"
             )
 
             compact_memory = rolling["summary"]
-
-            map_output = await map_batch(condensed_hits, compact_memory, session_id)
+            map_output = await map_batch(condensed, compact_memory)
             if map_output:
                 rolling, evidence_index = reduce(rolling, map_output, evidence_index)
 
             summary_tokens = _estimate_tokens(rolling.get("summary", ""))
             if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
                 rolling = await compress_analysis_summary(rolling)
-
-            queue.task_done()
-
-        # Phase 2: chunk and process SDK logs (if provided)
-        sdk_batches = chunk_sdk_logs(sdk_logs)
-        if sdk_batches:
-            logger.info(
-                f"[analysis_consumer] Processing {len(sdk_batches)} SDK log batches "
-                f"({sum(len(b) for b in sdk_batches)} lines)"
-            )
-            for condensed in sdk_batches:
-                batch_num += 1
-                logger.info(
-                    f"[analysis_consumer] Processing SDK batch {batch_num} "
-                    f"({len(condensed)} entries)"
-                )
-
-                compact_memory = rolling["summary"]
-                map_output = await map_batch(condensed, compact_memory, session_id)
-                if map_output:
-                    rolling, evidence_index = reduce(rolling, map_output, evidence_index)
-
-                summary_tokens = _estimate_tokens(rolling.get("summary", ""))
-                if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
-                    rolling = await compress_analysis_summary(rolling)
-
-    finally:
-        try:
-            await _session_service.delete_session(
-                app_name=_APP_NAME,
-                user_id=_USER_ID,
-                session_id=session_id,
-            )
-            logger.info(f"[analysis_consumer] Destroyed shared session {session_id}")
-        except Exception:
-            pass
 
     markdown = format_to_markdown(rolling, evidence_index, search_summary)
     logger.info(
@@ -738,8 +738,8 @@ async def analyze_upload_only(
     """Analyze SDK logs that were uploaded directly (no OpenSearch search).
 
     Splits the raw log text into line-based batches and runs the same
-    map -> reduce -> compress pipeline. A single temporary ADK session is
-    created for the entire upload analysis and destroyed at the end.
+    map -> reduce -> compress pipeline. Each batch gets a fresh ADK session
+    (created/destroyed inside map_batch) to avoid context bloat.
 
     Args:
         sdk_logs: raw log text pasted or uploaded by the user.
@@ -756,35 +756,16 @@ async def analyze_upload_only(
     rolling = new_rolling_analysis()
     evidence_index: list[dict] = []
 
-    session_id = f"upload-run-{uuid.uuid4().hex[:12]}"
-    await _session_service.create_session(
-        app_name=_APP_NAME,
-        user_id=_USER_ID,
-        session_id=session_id,
-    )
-    logger.info(f"[analyze_upload_only] Created shared session {session_id}")
+    for condensed in batches:
+        compact_memory = rolling["summary"]
+        map_output = await map_batch(condensed, compact_memory)
 
-    try:
-        for condensed in batches:
-            compact_memory = rolling["summary"]
-            map_output = await map_batch(condensed, compact_memory, session_id)
+        if map_output:
+            rolling, evidence_index = reduce(rolling, map_output, evidence_index)
 
-            if map_output:
-                rolling, evidence_index = reduce(rolling, map_output, evidence_index)
-
-            summary_tokens = _estimate_tokens(rolling.get("summary", ""))
-            if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
-                rolling = await compress_analysis_summary(rolling)
-    finally:
-        try:
-            await _session_service.delete_session(
-                app_name=_APP_NAME,
-                user_id=_USER_ID,
-                session_id=session_id,
-            )
-            logger.info(f"[analyze_upload_only] Destroyed shared session {session_id}")
-        except Exception:
-            pass
+        summary_tokens = _estimate_tokens(rolling.get("summary", ""))
+        if summary_tokens > ROLLING_SUMMARY_TOKEN_CAP:
+            rolling = await compress_analysis_summary(rolling)
 
     markdown = format_to_markdown(rolling, evidence_index, search_summary="(SDK log upload)")
     logger.info(
