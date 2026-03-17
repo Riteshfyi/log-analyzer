@@ -517,7 +517,7 @@ async def _extract_ids_from_batch(
 
     try:
         response = await litellm.acompletion(
-            model="openai/gpt-4.1",
+            model="openai/gpt-4.1-mini",
             api_key=api_key,
             api_base=api_base,
             extra_headers={"x-cisco-app": "microservice-log-analyzer"},
@@ -873,7 +873,7 @@ def extract_id_fields_for_llm(hits: list[dict]) -> list[dict]:
 
 def _make_model() -> SessionLiteLlm:
     return SessionLiteLlm(
-        model="openai/gpt-4.1",
+        model="openai/gpt-4.1-mini",
         api_key="pending-oauth",
         api_base=os.environ["AZURE_OPENAI_ENDPOINT"],
         extra_headers={"x-cisco-app": "microservice-log-analyzer"},
