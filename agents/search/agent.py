@@ -462,7 +462,7 @@ EXTRACTOR_KEY_TO_ID_TYPE = {
 SSE_CALLID_PATTERN = re.compile(r"SSE\d+@[\d.]+")
 
 # Pagination
-PAGE_SIZE = 100
+PAGE_SIZE = 500
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helper Functions
