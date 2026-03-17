@@ -115,7 +115,7 @@ Extract these from the CURRENT message only:
 
 - searchValue: the exact identifier string from the message
 - searchField: infer from the identifier pattern:
-    * Contains "webex-js-sdk_" or "webex-web-client_" or "MOBIUS_" → "trackingId"
+    * Contains "webex-js-sdk_" or "webex-web-client_" or "web_worker_" or "MOBIUS_" → "trackingId"
     * Contains "SSE" and "@" → "sipCallId"
     * 32-char hex (no dashes) → "sessionId"
     * UUID format (8-4-4-4-12 with dashes) → "callId"
